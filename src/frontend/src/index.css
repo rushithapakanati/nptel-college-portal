@@ -1,0 +1,172 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Outfit (body) */
+@font-face {
+  font-family: "Outfit";
+  src: url("/assets/fonts/Outfit.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Bricolage Grotesque (display) */
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("/assets/fonts/BricolageGrotesque.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+
+    /* NPTEL Academic Blue/Indigo Theme */
+    --background: 0.97 0.004 250;
+    --foreground: 0.15 0.025 255;
+
+    --card: 1 0 0;
+    --card-foreground: 0.15 0.025 255;
+
+    --popover: 1 0 0;
+    --popover-foreground: 0.15 0.025 255;
+
+    /* Deep indigo primary */
+    --primary: 0.32 0.12 264;
+    --primary-foreground: 0.98 0.005 260;
+
+    /* Light blue secondary */
+    --secondary: 0.92 0.03 250;
+    --secondary-foreground: 0.28 0.1 264;
+
+    --muted: 0.94 0.015 250;
+    --muted-foreground: 0.52 0.04 255;
+
+    /* Gold accent */
+    --accent: 0.88 0.12 85;
+    --accent-foreground: 0.15 0.04 80;
+
+    --destructive: 0.577 0.245 27.325;
+    --destructive-foreground: 0.985 0 0;
+
+    --border: 0.88 0.02 255;
+    --input: 0.88 0.02 255;
+    --ring: 0.45 0.12 264;
+
+    /* Charts */
+    --chart-1: 0.55 0.2 264;
+    --chart-2: 0.65 0.18 170;
+    --chart-3: 0.72 0.15 85;
+    --chart-4: 0.58 0.22 30;
+    --chart-5: 0.62 0.18 310;
+
+    --sidebar: 0.22 0.055 264;
+    --sidebar-foreground: 0.95 0.01 260;
+    --sidebar-primary: 0.65 0.18 264;
+    --sidebar-primary-foreground: 0.98 0.005 260;
+    --sidebar-accent: 0.3 0.07 264;
+    --sidebar-accent-foreground: 0.95 0.01 260;
+    --sidebar-border: 0.35 0.06 264;
+    --sidebar-ring: 0.55 0.12 264;
+
+    /* Custom NPTEL tokens */
+    --nptel-deep: 0.2 0.09 264;
+    --nptel-mid: 0.38 0.12 264;
+    --nptel-light: 0.6 0.14 264;
+    --nptel-gold: 0.78 0.14 85;
+    --nptel-success: 0.6 0.16 145;
+    --nptel-warning: 0.72 0.17 80;
+    --nptel-error: 0.62 0.2 25;
+  }
+
+  .dark {
+    --background: 0.12 0.03 264;
+    --foreground: 0.94 0.01 255;
+
+    --card: 0.17 0.04 264;
+    --card-foreground: 0.94 0.01 255;
+
+    --popover: 0.2 0.05 264;
+    --popover-foreground: 0.94 0.01 255;
+
+    --primary: 0.65 0.18 264;
+    --primary-foreground: 0.12 0.03 264;
+
+    --secondary: 0.25 0.06 264;
+    --secondary-foreground: 0.94 0.01 255;
+
+    --muted: 0.22 0.05 264;
+    --muted-foreground: 0.6 0.04 255;
+
+    --accent: 0.72 0.12 85;
+    --accent-foreground: 0.15 0.04 80;
+
+    --destructive: 0.704 0.191 22.216;
+    --destructive-foreground: 0.205 0 0;
+
+    --border: 1 0 0 / 10%;
+    --input: 1 0 0 / 15%;
+    --ring: 0.55 0.12 264;
+
+    --chart-1: 0.65 0.18 264;
+    --chart-2: 0.7 0.16 170;
+    --chart-3: 0.75 0.14 85;
+    --chart-4: 0.65 0.2 30;
+    --chart-5: 0.68 0.16 310;
+
+    --sidebar: 0.12 0.03 264;
+    --sidebar-foreground: 0.94 0.01 255;
+    --sidebar-primary: 0.65 0.18 264;
+    --sidebar-primary-foreground: 0.12 0.03 264;
+    --sidebar-accent: 0.22 0.05 264;
+    --sidebar-accent-foreground: 0.94 0.01 255;
+    --sidebar-border: 1 0 0 / 10%;
+    --sidebar-ring: 0.55 0.12 264;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: "Outfit", sans-serif;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: "Bricolage Grotesque", sans-serif;
+  }
+}
+
+@layer utilities {
+  .nptel-deep-bg {
+    background-color: oklch(var(--nptel-deep));
+  }
+  .nptel-mid-bg {
+    background-color: oklch(var(--nptel-mid));
+  }
+  .nptel-gold-text {
+    color: oklch(var(--nptel-gold));
+  }
+  .nptel-gradient {
+    background: linear-gradient(
+      135deg,
+      oklch(var(--nptel-deep)) 0%,
+      oklch(var(--nptel-mid)) 60%,
+      oklch(0.42 0.14 264) 100%
+    );
+  }
+  .glass-card {
+    background: oklch(1 0 0 / 0.08);
+    backdrop-filter: blur(12px);
+    border: 1px solid oklch(1 0 0 / 0.15);
+  }
+}

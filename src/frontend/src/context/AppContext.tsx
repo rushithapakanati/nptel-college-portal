@@ -23,6 +23,13 @@ export interface CurrentUser {
   email?: string;
 }
 
+export interface FileSnapshot {
+  fileName: string;
+  records: StudentUploadRecord[];
+  errors: EnrollmentError[] | ExamRegError[];
+  timestamp: number;
+}
+
 // Per-campus data store
 interface CampusData {
   hodPermissions: HodPermissions;
@@ -40,6 +47,9 @@ interface CampusData {
   hodEditedRecords: HodEditedRecord[];
   // Records uploaded by HOD (for student dashboard lookup)
   hodUploadedRecords: StudentUploadRecord[];
+  // File version snapshots
+  enrollmentFileSnapshots: FileSnapshot[];
+  examRegFileSnapshots: FileSnapshot[];
 }
 
 function createEmptyCampusData(): CampusData {
@@ -56,6 +66,8 @@ function createEmptyCampusData(): CampusData {
     uploadedShuffleRecords: [],
     hodEditedRecords: [],
     hodUploadedRecords: [],
+    enrollmentFileSnapshots: [],
+    examRegFileSnapshots: [],
   };
 }
 
@@ -63,7 +75,6 @@ interface AppContextValue {
   currentUser: CurrentUser | null;
   setCurrentUser: (user: CurrentUser | null) => void;
 
-  // These operate on the currently-active campus (derived from currentUser.college)
   hodPermissions: HodPermissions;
   updateHodPermission: (
     branch: Branch,
@@ -103,6 +114,11 @@ interface AppContextValue {
   hodUploadedRecords: StudentUploadRecord[];
   setHodUploadedRecords: (records: StudentUploadRecord[]) => void;
   appendHodUploadedRecords: (records: StudentUploadRecord[]) => void;
+  // File snapshots
+  enrollmentFileSnapshots: FileSnapshot[];
+  addEnrollmentSnapshot: (snapshot: FileSnapshot) => void;
+  examRegFileSnapshots: FileSnapshot[];
+  addExamRegSnapshot: (snapshot: FileSnapshot) => void;
   logout: () => void;
 }
 
@@ -113,23 +129,19 @@ const AppContext = createContext<AppContextValue | null>(null);
 export function AppProvider({ children }: { children: ReactNode }) {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
 
-  // Keyed by lowercase campus name — completely isolated per campus
   const [campusDataMap, setCampusDataMap] = useState<
     Record<string, CampusData>
   >({});
 
-  // Returns the normalized campus key for state lookups
   function campusKey(college?: string): string {
     return (college ?? currentUser?.college ?? "").toLowerCase().trim();
   }
 
-  // Returns the campus data for the current (or specified) campus, creating it if missing
   function getCampusData(college?: string): CampusData {
     const key = campusKey(college);
     return campusDataMap[key] ?? createEmptyCampusData();
   }
 
-  // Updates a subset of one campus's data
   function patchCampus(update: Partial<CampusData>, college?: string) {
     const key = campusKey(college);
     setCampusDataMap((prev) => ({
@@ -138,10 +150,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }));
   }
 
-  // ── Derived campus state ──────────────────────────────────────────────────
   const campus = getCampusData();
-
-  // ── Accessors ─────────────────────────────────────────────────────────────
 
   function updateHodPermission(
     branch: Branch,
@@ -240,6 +249,40 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   }
 
+  function addEnrollmentSnapshot(snapshot: FileSnapshot) {
+    const key = campusKey();
+    setCampusDataMap((prev) => {
+      const existing = prev[key] ?? createEmptyCampusData();
+      return {
+        ...prev,
+        [key]: {
+          ...existing,
+          enrollmentFileSnapshots: [
+            ...(existing.enrollmentFileSnapshots ?? []),
+            snapshot,
+          ],
+        },
+      };
+    });
+  }
+
+  function addExamRegSnapshot(snapshot: FileSnapshot) {
+    const key = campusKey();
+    setCampusDataMap((prev) => {
+      const existing = prev[key] ?? createEmptyCampusData();
+      return {
+        ...prev,
+        [key]: {
+          ...existing,
+          examRegFileSnapshots: [
+            ...(existing.examRegFileSnapshots ?? []),
+            snapshot,
+          ],
+        },
+      };
+    });
+  }
+
   function logout() {
     setCurrentUser(null);
   }
@@ -330,6 +373,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
             };
           });
         },
+
+        enrollmentFileSnapshots: campus.enrollmentFileSnapshots ?? [],
+        addEnrollmentSnapshot,
+
+        examRegFileSnapshots: campus.examRegFileSnapshots ?? [],
+        addExamRegSnapshot,
 
         logout,
       }}

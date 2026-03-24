@@ -281,7 +281,7 @@ type XLSXLib = any;
 
 let xlsxLibCache: XLSXLib | null = null;
 
-async function loadXLSXLib(): Promise<XLSXLib> {
+export async function loadXLSXLib(): Promise<XLSXLib> {
   if (xlsxLibCache) return xlsxLibCache;
   // Check if already loaded globally
   if (
@@ -633,6 +633,11 @@ export function validateEnrollmentRows(
       "collegeemail",
       "Institute Email",
       "instituteemail",
+      "College Email/Personal Email",
+      "Personal Email",
+      "personal_email",
+      "College/Personal Email",
+      "college_personal_email",
     );
 
     const courseId = col(
@@ -734,7 +739,7 @@ export function validateEnrollmentRows(
     // ── Validation checks (all checks run independently per row, multiple errors possible) ──
 
     // Helper: extract the prefix letter from student ID (first character)
-    const studentIdLetter = studentId ? studentId.charAt(0).toLowerCase() : "";
+    const _studentIdLetter = studentId ? studentId.charAt(0).toLowerCase() : "";
     // Valid student ID format: campus-letter + exactly 6 digits (e.g. n200623, s120042)
     const validStudentIdFormat = /^[a-z]\d{6}$/i;
 
@@ -746,7 +751,8 @@ export function validateEnrollmentRows(
         email: "(missing)",
         courseId,
         errorType: "Missing Email",
-        details: `No email found for student ID "${studentId}"`,
+        details: "No email provided",
+        courseName: courseName || undefined,
         branch,
       });
     } else if (!emailPattern.test(email)) {
@@ -756,7 +762,8 @@ export function validateEnrollmentRows(
         email,
         courseId,
         errorType: "Invalid Email",
-        details: `Email "${email}" does not match campus email format (expected: ${idPrefix}xxxxxx@${collegeName.toLowerCase().includes("nuzvid") ? "rguktn" : collegeName.toLowerCase().includes("srikakulam") ? "rguktsklm" : collegeName.toLowerCase().includes("rk valley") ? "rguktrkv" : "rguktong"}.ac.in)`,
+        details: "Invalid email format for this campus",
+        courseName: courseName || undefined,
         branch,
       });
     }
@@ -769,7 +776,8 @@ export function validateEnrollmentRows(
         email,
         courseId,
         errorType: "Missing Student ID",
-        details: `No student ID found for email "${email}"`,
+        details: "No student ID provided",
+        courseName: courseName || undefined,
         branch,
       });
     } else if (!validStudentIdFormat.test(studentId)) {
@@ -779,7 +787,8 @@ export function validateEnrollmentRows(
         email,
         courseId,
         errorType: "Invalid Student ID Format",
-        details: `Student ID "${studentId}" is not in the correct format. Expected: ${idPrefix.toUpperCase()} followed by exactly 6 digits (e.g. ${idPrefix}200623)`,
+        details: "Invalid ID format (expected: campus letter + 6 digits)",
+        courseName: courseName || undefined,
         branch,
       });
     } else if (!studentId.toLowerCase().startsWith(idPrefix)) {
@@ -790,7 +799,8 @@ export function validateEnrollmentRows(
         email,
         courseId,
         errorType: "Invalid Student ID Prefix",
-        details: `Student ID "${studentId}" starts with "${studentIdLetter.toUpperCase()}" but this campus requires "${idPrefix.toUpperCase()}"`,
+        details: "Wrong campus prefix in student ID",
+        courseName: courseName || undefined,
         branch,
       });
     }
@@ -805,7 +815,8 @@ export function validateEnrollmentRows(
         email,
         courseId: "(missing)",
         errorType: "Missing Course ID",
-        details: `No course ID found in the Course ID / NPTEL Course ID column for student "${studentId}". Ensure the file has a column named "Course ID" or "NPTEL Course ID".`,
+        details: "Mismatch of course id - in uploaded data by hod/dean",
+        courseName: courseName || undefined,
         branch,
       });
     } else {
@@ -821,7 +832,8 @@ export function validateEnrollmentRows(
           email,
           courseId,
           errorType: "Invalid Course ID Format",
-          details: `Course ID "${courseId}" is not in the correct Enrollment format. Expected format: noc${currentYear}-<subject> (e.g. noc${currentYear}-ec50). Enrollment IDs use a hyphen (-) as separator.`,
+          details: `Wrong course ID format (expected: noc${currentYear}-xxx for enrollment)`,
+          courseName: courseName || undefined,
           branch,
         });
       } else if (courseYearMatch && courseYearMatch[1] !== currentYear) {
@@ -832,7 +844,8 @@ export function validateEnrollmentRows(
           email,
           courseId,
           errorType: "Course ID Year Mismatch",
-          details: `Course ID "${courseId}" has year "noc${courseYearMatch[1]}" but the current year is 20${currentYear}. Expected: noc${currentYear}-<subject>.`,
+          details: `Course ID year mismatch (expected noc${currentYear})`,
+          courseName: courseName || undefined,
           branch,
         });
       }
@@ -845,7 +858,8 @@ export function validateEnrollmentRows(
           email,
           courseId,
           errorType: "Invalid Course Duration",
-          details: `Course duration is ${durationWeeks} weeks — only 12-week courses are valid for NPTEL enrollment`,
+          details: "Course is not 12 weeks",
+          courseName: courseName || undefined,
           branch,
         });
       }
@@ -868,7 +882,8 @@ export function validateEnrollmentRows(
             email,
             courseId,
             errorType: "Course Not in Course File",
-            details: `Course ID "${courseId}" was not found in the course file uploaded by Dean. Only courses listed in the Dean's course file are valid.`,
+            details: "Course ID not found in dean's course file",
+            courseName: courseName || undefined,
             branch,
           });
         } else if (matchedCourse && matchedCourse.durationWeeks !== 12) {
@@ -879,7 +894,8 @@ export function validateEnrollmentRows(
             email,
             courseId,
             errorType: "Not a 12-week Course",
-            details: `Student registered for course "${courseId}" which is a ${matchedCourse.durationWeeks}-week course. Only 12-week courses are valid for NPTEL enrollment.`,
+            details: "Not a 12-week course",
+            courseName: courseName || undefined,
             branch,
           });
         }
@@ -966,6 +982,11 @@ export function validateExamRegRows(
       "studentemail",
       "Mail ID",
       "mailid",
+      "College Email/Personal Email",
+      "Personal Email",
+      "personal_email",
+      "College/Personal Email",
+      "college_personal_email",
     );
 
     const courseId = col(
@@ -1009,6 +1030,16 @@ export function validateExamRegRows(
       "usertype",
       "Category",
       "category",
+    );
+
+    const courseName = col(
+      row,
+      "Course Name",
+      "CourseName",
+      "course_name",
+      "Course Title",
+      "coursetitle",
+      "Subject",
     );
 
     // Skip empty rows
@@ -1063,8 +1094,9 @@ export function validateExamRegRows(
         errorType,
         details:
           classification === "Redo Registration"
-            ? `Payment not completed (${paymentStatus}), re-registration required`
-            : `Student has not registered for exam (status: "${paymentStatus || "empty"}")`,
+            ? "Re-do registration required (payment pending)"
+            : "Registration not done",
+        courseName: courseName || undefined,
         branch,
       });
     }
@@ -1072,7 +1104,7 @@ export function validateExamRegRows(
     // ── Email validation for exam reg (same rules as enrollment) ──
     if (collegeName) {
       const emailPattern = getStudentEmailPattern(collegeName);
-      const emailDomain = getStudentEmailDomain(collegeName);
+      const _emailDomain = getStudentEmailDomain(collegeName);
       if (!email) {
         errors.push({
           id: `examreg-noemail-${i}`,
@@ -1082,7 +1114,8 @@ export function validateExamRegRows(
           paymentStatus,
           classification: "Invalid",
           errorType: "Missing Email",
-          details: `No email found for student ID "${studentId}" in exam registration file`,
+          details: "No email provided",
+          courseName: courseName || undefined,
           branch,
         });
       } else if (!emailPattern.test(email)) {
@@ -1094,7 +1127,8 @@ export function validateExamRegRows(
           paymentStatus,
           classification: "Invalid",
           errorType: "Invalid Email",
-          details: `Email "${email}" does not match campus email format (expected: [prefix]xxxxxx@${emailDomain})`,
+          details: "Invalid email format for this campus",
+          courseName: courseName || undefined,
           branch,
         });
       }
@@ -1112,7 +1146,8 @@ export function validateExamRegRows(
         paymentStatus,
         classification: "Invalid",
         errorType: "Missing Course ID",
-        details: `No course ID found in the Course ID / NPTEL Course ID column for student "${studentId}". Ensure the file has a column named "Course ID" or "NPTEL Course ID".`,
+        details: "Mismatch of course id - in uploaded data by hod/dean",
+        courseName: courseName || undefined,
         branch,
       });
     } else {
@@ -1130,7 +1165,8 @@ export function validateExamRegRows(
           paymentStatus,
           classification: "Invalid",
           errorType: "Invalid Course ID Format",
-          details: `Course ID "${courseId}" is not in the correct Exam Registration format. Expected format: ns_noc${currentYear}_<subject> (e.g. ns_noc${currentYear}_ec50). Exam Registration IDs start with "ns_" and use underscores (_) as separators.`,
+          details: `Wrong course ID format (expected: ns_noc${currentYear}_xxx for exam reg)`,
+          courseName: courseName || undefined,
           branch,
         });
       } else if (courseYearMatch && courseYearMatch[1] !== currentYear) {
@@ -1143,7 +1179,8 @@ export function validateExamRegRows(
           paymentStatus,
           classification: "Invalid",
           errorType: "Course ID Year Mismatch",
-          details: `Course ID "${courseId}" has year "noc${courseYearMatch[1]}" but the current year is 20${currentYear}. Expected: ns_noc${currentYear}_<subject>.`,
+          details: `Course ID year mismatch (expected noc${currentYear})`,
+          courseName: courseName || undefined,
           branch,
         });
       }
@@ -1170,7 +1207,8 @@ export function validateExamRegRows(
             paymentStatus,
             classification: "Invalid",
             errorType: "Course Not in Course File",
-            details: `Course ID "${courseId}" (normalized: "${normalizedForLookup}") was not found in the course file uploaded by Dean. Only courses listed in the Dean's course file are valid.`,
+            details: "Course ID not found in dean's course file",
+            courseName: courseName || undefined,
             branch,
           });
         }
@@ -1334,6 +1372,24 @@ export function parseExamShuffleRows(
       "usertype",
     );
 
+    const seatingNumber = col(
+      row,
+      "Seating Number",
+      "seatingnumber",
+      "seating_number",
+      "Seating No",
+      "seatingno",
+      "Seating Position",
+      "seatingposition",
+      "seating_position",
+      "Seat No",
+      "seatno",
+      "Seat Number",
+      "seatnumber",
+      "Seat",
+      "seat",
+    );
+
     // Skip completely empty rows
     if (!studentId && !email && !courseId) continue;
 
@@ -1353,6 +1409,7 @@ export function parseExamShuffleRows(
       examDate: examDate || undefined,
       examSlot: examSlot || undefined,
       hallTicketNo: hallTicketNo || undefined,
+      seatingNumber: seatingNumber || undefined,
     });
   }
 
@@ -1414,4 +1471,100 @@ export function parseExamRegRecords(
     });
   }
   return records;
+}
+
+// ─── Cross-match Enrollment vs Exam Registration ──────────────────────────────
+
+export interface CrossMatchError {
+  studentId: string;
+  email: string;
+  courseId: string;
+  courseName?: string;
+  errorType: "Missing Exam Registration" | "Missing Enrollment";
+  details: string;
+  branch: string;
+}
+
+/** Normalize a course ID to enrollment format: noc26-ec50 */
+function normalizeCourseId(id: string): string {
+  return id.trim().toLowerCase().replace(/^ns_/, "").replace(/_/g, "-");
+}
+
+/**
+ * Cross-checks enrollment records against exam registration records for 12-week courses.
+ * - Enrolled in a 12-week course but no exam reg found → "Missing Exam Registration"
+ * - Exam reg for a 12-week course but no enrollment found → "Missing Enrollment"
+ */
+export function crossMatchEnrollmentExamReg(
+  enrollmentRecords: StudentUploadRecord[],
+  examRegRecords: StudentUploadRecord[],
+  uploadedCourses: Course[],
+): CrossMatchError[] {
+  const errors: CrossMatchError[] = [];
+  const twelveWeekCourseIds = new Set(
+    uploadedCourses.map((c) => normalizeCourseId(c.courseId)),
+  );
+  if (twelveWeekCourseIds.size === 0) return errors;
+
+  const courseNameMap = new Map(
+    uploadedCourses.map((c) => [normalizeCourseId(c.courseId), c.courseName]),
+  );
+
+  // Build set of {studentId}::{courseId} from exam reg
+  const examRegSet = new Set<string>();
+  for (const r of examRegRecords) {
+    const normCourse = normalizeCourseId(r.examCourseId ?? r.courseId);
+    if (twelveWeekCourseIds.has(normCourse)) {
+      examRegSet.add(`${r.studentId.trim().toLowerCase()}::${normCourse}`);
+    }
+  }
+
+  // Build set of {studentId}::{courseId} from enrollment
+  const enrollSet = new Set<string>();
+  for (const r of enrollmentRecords) {
+    const normCourse = normalizeCourseId(r.courseId);
+    if (twelveWeekCourseIds.has(normCourse)) {
+      enrollSet.add(`${r.studentId.trim().toLowerCase()}::${normCourse}`);
+    }
+  }
+
+  // Check enrollment → exam reg
+  for (const r of enrollmentRecords) {
+    const normCourse = normalizeCourseId(r.courseId);
+    if (!twelveWeekCourseIds.has(normCourse)) continue;
+    const key = `${r.studentId.trim().toLowerCase()}::${normCourse}`;
+    if (!examRegSet.has(key)) {
+      errors.push({
+        studentId: r.studentId,
+        email: r.email,
+        courseId: r.courseId,
+        courseName: r.courseName ?? courseNameMap.get(normCourse),
+        errorType: "Missing Exam Registration",
+        details:
+          "Enrolled in this 12-week course but no exam registration found",
+        branch: r.branch,
+      });
+    }
+  }
+
+  // Check exam reg → enrollment
+  for (const r of examRegRecords) {
+    const normCourse = normalizeCourseId(r.examCourseId ?? r.courseId);
+    if (!twelveWeekCourseIds.has(normCourse)) continue;
+    const key = `${r.studentId.trim().toLowerCase()}::${normCourse}`;
+    if (!enrollSet.has(key)) {
+      errors.push({
+        studentId: r.studentId,
+        email: r.email,
+        courseId: r.examCourseId ?? r.courseId,
+        courseName: r.courseName ?? courseNameMap.get(normCourse),
+        errorType: "Missing Enrollment",
+        details:
+          "Exam registration found but no enrollment record for this course",
+        branch: r.branch,
+      });
+    }
+  }
+
+  return errors;
 }

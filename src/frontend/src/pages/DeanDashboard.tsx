@@ -7,6 +7,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -35,6 +41,8 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Database,
+  Download,
+  Eye,
   FileText,
   Filter,
   LogOut,
@@ -67,9 +75,18 @@ import {
 } from "recharts";
 import { toast } from "sonner";
 import { useAppContext } from "../context/AppContext";
-import { BRANCHES, type Branch, type HodPermission } from "../data/mockData";
 import {
+  BRANCHES,
+  type Branch,
+  type EnrollmentError,
+  type ExamRegError,
+  type HodPermission,
+} from "../data/mockData";
+import {
+  type CrossMatchError,
+  crossMatchEnrollmentExamReg,
   getFileHeaders,
+  loadXLSXLib,
   parseCourseRows,
   parseExamRegRecords,
   parseExamShuffleRows,
@@ -79,6 +96,31 @@ import {
 } from "../utils/fileParser";
 
 const PIE_COLORS = ["#4f46e5", "#f59e0b", "#ef4444"];
+
+async function downloadErrorsAsExcel<
+  T extends {
+    studentId: string;
+    email: string;
+    courseId: string;
+    courseName?: string;
+    errorType: string;
+    details?: string;
+  },
+>(errors: T[], filename: string) {
+  const XLSX = await loadXLSXLib();
+  const rows = errors.map((e) => ({
+    "Student ID": e.studentId,
+    Email: e.email,
+    "Course ID": e.courseId,
+    "Course Name": e.courseName || "",
+    "Error Type": e.errorType,
+    Description: e.details || "",
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Errors");
+  XLSX.writeFile(wb, filename);
+}
 
 function classifyPaymentStatus(status?: string): "done" | "redo" | "doFirst" {
   if (!status) return "doFirst";
@@ -121,6 +163,10 @@ export default function DeanDashboard() {
     setUploadedCourses,
     deanStudentDataUploaded,
     setDeanStudentDataUploaded,
+    enrollmentFileSnapshots,
+    addEnrollmentSnapshot,
+    examRegFileSnapshots,
+    addExamRegSnapshot,
     deanCourseFileUploaded,
     setDeanCourseFileUploaded,
     deanExamRegDataUploaded,
@@ -134,6 +180,13 @@ export default function DeanDashboard() {
   } = useAppContext();
 
   // ── local perm edit state per branch ──
+  const [viewErrorDeanDialog, setViewErrorDeanDialog] = useState<{
+    details: string;
+    courseName?: string;
+    courseId?: string;
+    errorType?: string;
+    studentId?: string;
+  } | null>(null);
   const [pendingPerms, setPendingPerms] = useState<
     Record<Branch, HodPermission>
   >(
@@ -184,6 +237,22 @@ export default function DeanDashboard() {
   const COURSE_PAGE_SIZE = 50;
   const [coursePage, setCoursePage] = useState(1);
 
+  // ── Enrollment/Exam Reg record counts (tracked separately) ──
+  const [enrollmentRecordCount, setEnrollmentRecordCount] = useState(0);
+  const [enrollBranchCounts, setEnrollBranchCounts] = useState<
+    Record<string, number>
+  >({});
+  const [_examRegRecordCount, setExamRegRecordCount] = useState(0);
+  // ── Cross-match errors ──
+  const [crossMatchErrors, setCrossMatchErrors] = useState<CrossMatchError[]>(
+    [],
+  );
+  // ── Snapshot selection (for viewing previous file data) ──
+  const [selectedEnrollmentSnapshotIdx, setSelectedEnrollmentSnapshotIdx] =
+    useState<number | null>(null);
+  const [selectedExamRegSnapshotIdx, setSelectedExamRegSnapshotIdx] = useState<
+    number | null
+  >(null);
   // ── Refresh state ──
   const [_refreshKey, setRefreshKey] = useState(0);
   function handleRefresh() {
@@ -258,6 +327,22 @@ export default function DeanDashboard() {
       setEnrollmentErrors(errors);
       setDeanStudentDataUploaded(true);
       setEnrollmentFileNames((prev) => [...prev, file.name]);
+      setEnrollmentRecordCount(records.length);
+      // Build per-branch enrollment counts from this file only
+      const branchCountMap: Record<string, number> = {};
+      for (const r of records) {
+        if (r.profession?.toLowerCase() === "faculty") continue;
+        branchCountMap[r.branch] = (branchCountMap[r.branch] ?? 0) + 1;
+      }
+      setEnrollBranchCounts(branchCountMap);
+      // Save snapshot for versioning
+      addEnrollmentSnapshot({
+        fileName: file.name,
+        records,
+        errors,
+        timestamp: Date.now(),
+      });
+      setSelectedEnrollmentSnapshotIdx(null); // show latest
       toast.success(
         `Student data "${file.name}" parsed: ${records.length} student records, ${errors.length} errors found.`,
       );
@@ -328,6 +413,22 @@ export default function DeanDashboard() {
       setExamRegErrors(examErrors);
       setDeanExamRegDataUploaded(true);
       setExamRegFileNames((prev) => [...prev, file.name]);
+      setExamRegRecordCount(examRecords.length);
+      // Save snapshot for versioning
+      addExamRegSnapshot({
+        fileName: file.name,
+        records: examRecords,
+        errors: examErrors,
+        timestamp: Date.now(),
+      });
+      setSelectedExamRegSnapshotIdx(null); // show latest
+      // Run cross-match if both files uploaded
+      const crossErrors = crossMatchEnrollmentExamReg(
+        uploadedStudentRecords,
+        examRecords,
+        uploadedCourses,
+      );
+      setCrossMatchErrors(crossErrors);
       toast.success(
         `Exam registration "${file.name}" parsed: ${examErrors.length} errors found.`,
       );
@@ -392,34 +493,50 @@ export default function DeanDashboard() {
     }
   }
 
-  // ── Dynamic stats from uploaded data ──
-  const branchStatsMap = new Map<
+  // ── Enrollment branch stats (all uploaded student records = enrollment data) ──
+
+  const enrollBranchStats = BRANCHES.map((b) => ({
+    branch: b,
+    total: enrollBranchCounts[b] ?? 0,
+  }));
+
+  // ── Exam reg branch stats (records that have paymentStatus = have exam reg data) ──
+  const examRegBranchStatsMap = new Map<
     Branch,
     { done: number; redo: number; doFirst: number }
   >();
   for (const b of BRANCHES) {
-    branchStatsMap.set(b, { done: 0, redo: 0, doFirst: 0 });
+    examRegBranchStatsMap.set(b, { done: 0, redo: 0, doFirst: 0 });
   }
-
   for (const r of uploadedStudentRecords.filter(
-    (record) => record.profession?.toLowerCase() !== "faculty",
+    (record) =>
+      record.profession?.toLowerCase() !== "faculty" &&
+      record.paymentStatus !== undefined &&
+      record.paymentStatus !== null &&
+      record.paymentStatus !== "",
   )) {
-    const stats = branchStatsMap.get(r.branch);
+    const stats = examRegBranchStatsMap.get(r.branch);
     if (!stats) continue;
     const cls = classifyPaymentStatus(r.paymentStatus);
     stats[cls]++;
   }
-
   const dynamicBranchStats = BRANCHES.map((b) => ({
     branch: b,
-    ...(branchStatsMap.get(b) ?? { done: 0, redo: 0, doFirst: 0 }),
+    ...(examRegBranchStatsMap.get(b) ?? { done: 0, redo: 0, doFirst: 0 }),
   }));
 
-  const totalStudents = uploadedStudentRecords.filter(
+  const _totalEnrollStudents = uploadedStudentRecords.filter(
     (r) => r.profession?.toLowerCase() !== "faculty",
   ).length;
-  const totalErrors = enrollmentErrors.length + examRegErrors.length;
-  const branchesWithData = new Set(
+  const totalStudents = uploadedStudentRecords.filter(
+    (r) =>
+      r.profession?.toLowerCase() !== "faculty" &&
+      r.paymentStatus !== undefined &&
+      r.paymentStatus !== null &&
+      r.paymentStatus !== "",
+  ).length;
+  // enrollmentErrors.length + examRegErrors.length tracked separately
+  const _branchesWithData = new Set(
     uploadedStudentRecords
       .filter((r) => r.profession?.toLowerCase() !== "faculty")
       .map((r) => r.branch),
@@ -675,51 +792,126 @@ export default function DeanDashboard() {
                 </div>
               ) : (
                 <>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-8">
-                    {[
-                      {
-                        label: "Total Students",
-                        value: totalStudents,
-                        icon: Users,
-                        color: "text-blue-600",
-                      },
-                      {
-                        label: "Total Errors",
-                        value: totalErrors,
-                        icon: AlertCircle,
-                        color: "text-red-500",
-                      },
-                      {
-                        label: "Branches Active",
-                        value: branchesWithData,
-                        icon: BookOpen,
-                        color: "text-green-600",
-                      },
-                    ].map((stat, i) => {
-                      const Icon = stat.icon;
-                      return (
-                        <Card
-                          key={stat.label}
-                          data-ocid={`dean.overview.card.${i + 1}`}
-                        >
-                          <CardContent className="pt-6">
-                            <div className="flex items-center justify-between">
-                              <div>
-                                <p className="text-sm text-muted-foreground">
-                                  {stat.label}
-                                </p>
-                                <p className="text-3xl font-display font-bold mt-1">
-                                  {stat.value}
-                                </p>
-                              </div>
-                              <Icon
-                                className={`h-10 w-10 ${stat.color} opacity-70`}
-                              />
+                  {/* Enrollment Overview */}
+                  <div className="mb-6">
+                    <p className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wide">
+                      Enrollment Overview
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                      <Card className="bg-blue-50">
+                        <CardContent className="pt-4 pb-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-xs text-muted-foreground">
+                                Total Enrolled
+                              </p>
+                              <p className="text-2xl font-display font-bold mt-0.5">
+                                {enrollmentRecordCount}
+                              </p>
                             </div>
-                          </CardContent>
-                        </Card>
-                      );
-                    })}
+                            <BookOpen className="h-8 w-8 text-blue-400 opacity-70" />
+                          </div>
+                        </CardContent>
+                      </Card>
+                      <Card className="bg-red-50">
+                        <CardContent className="pt-4 pb-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-xs text-muted-foreground">
+                                Enrollment Errors
+                              </p>
+                              <p className="text-2xl font-display font-bold mt-0.5">
+                                {enrollmentErrors.length}
+                              </p>
+                            </div>
+                            <AlertCircle className="h-8 w-8 text-red-400 opacity-70" />
+                          </div>
+                        </CardContent>
+                      </Card>
+                      <Card className="bg-slate-50">
+                        <CardContent className="pt-4 pb-4">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-xs text-muted-foreground">
+                                Clean Records
+                              </p>
+                              <p className="text-2xl font-display font-bold mt-0.5">
+                                {Math.max(
+                                  0,
+                                  enrollmentRecordCount -
+                                    enrollmentErrors.length,
+                                )}
+                              </p>
+                            </div>
+                            <CheckCircle2 className="h-8 w-8 text-green-400 opacity-70" />
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </div>
+                  </div>
+
+                  {/* Exam Registration Overview */}
+                  <div className="mb-6">
+                    <p className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wide">
+                      Exam Registration Overview
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                      {[
+                        {
+                          label: "Total Registered",
+                          value: totalStudents,
+                          icon: Users,
+                          color: "text-purple-600",
+                          bg: "bg-purple-50",
+                        },
+                        {
+                          label: "Done",
+                          value: totalDone,
+                          icon: CheckCircle2,
+                          color: "text-green-600",
+                          bg: "bg-green-50",
+                        },
+                        {
+                          label: "Redo Registration",
+                          value: totalRedo,
+                          icon: AlertCircle,
+                          color: "text-amber-600",
+                          bg: "bg-amber-50",
+                        },
+                        {
+                          label: "First Time Registration",
+                          value: totalDoFirst,
+                          icon: Users,
+                          color: "text-blue-600",
+                          bg: "bg-blue-50",
+                        },
+                      ].map((stat, i) => {
+                        const Icon = stat.icon;
+                        return (
+                          <Card
+                            key={stat.label}
+                            data-ocid={`dean.overview.card.${i + 1}`}
+                            className={stat.bg}
+                          >
+                            <CardContent className="pt-4 pb-4">
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <p className="text-xs text-muted-foreground">
+                                    {stat.label}
+                                  </p>
+                                  <p className="text-2xl font-display font-bold mt-0.5">
+                                    {stat.value}
+                                  </p>
+                                </div>
+                                <Icon
+                                  className={`h-8 w-8 ${stat.color} opacity-70`}
+                                />
+                              </div>
+                            </CardContent>
+                          </Card>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   {/* Per-branch summary */}
@@ -737,23 +929,55 @@ export default function DeanDashboard() {
                         <Table>
                           <TableHeader>
                             <TableRow className="bg-muted/50">
-                              <TableHead>Branch</TableHead>
-                              <TableHead>Total Students</TableHead>
-                              {deanExamRegDataUploaded && (
-                                <>
-                                  <TableHead>Done</TableHead>
-                                  <TableHead>Do First Reg</TableHead>
-                                </>
-                              )}
-                              <TableHead>Enrollment Errors</TableHead>
-                              {deanExamRegDataUploaded && (
-                                <TableHead>Exam Reg Errors</TableHead>
-                              )}
+                              <TableHead
+                                rowSpan={2}
+                                className="align-middle border-r"
+                              >
+                                Branch
+                              </TableHead>
+                              <TableHead
+                                colSpan={2}
+                                className="text-center text-blue-700 border-r bg-blue-50/50"
+                              >
+                                Enrollment
+                              </TableHead>
+                              <TableHead
+                                colSpan={5}
+                                className="text-center text-purple-700 bg-purple-50/50"
+                              >
+                                Exam Registration
+                              </TableHead>
+                            </TableRow>
+                            <TableRow className="bg-muted/30">
+                              <TableHead className="text-blue-600 text-xs">
+                                Total
+                              </TableHead>
+                              <TableHead className="text-blue-600 text-xs border-r">
+                                Errors
+                              </TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Total
+                              </TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Done
+                              </TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Redo
+                              </TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Do First
+                              </TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Errors
+                              </TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
                             {BRANCHES.map((branch, i) => {
-                              const stats = dynamicBranchStats.find(
+                              const enrollStats = enrollBranchStats.find(
+                                (b) => b.branch === branch,
+                              );
+                              const examStats = dynamicBranchStats.find(
                                 (b) => b.branch === branch,
                               );
                               const eErr = enrollmentErrors.filter(
@@ -762,37 +986,22 @@ export default function DeanDashboard() {
                               const rErr = examRegErrors.filter(
                                 (e) => e.branch === branch,
                               ).length;
-                              const total = uploadedStudentRecords.filter(
-                                (r) =>
-                                  r.branch === branch &&
-                                  r.profession?.toLowerCase() !== "faculty",
-                              ).length;
+                              const examTotal =
+                                (examStats?.done ?? 0) +
+                                (examStats?.redo ?? 0) +
+                                (examStats?.doFirst ?? 0);
                               return (
                                 <TableRow
                                   key={branch}
                                   data-ocid={`dean.overview.row.${i + 1}`}
                                 >
-                                  <TableCell>
+                                  <TableCell className="border-r">
                                     <Badge variant="outline">{branch}</Badge>
                                   </TableCell>
-                                  <TableCell className="font-medium">
-                                    {total}
+                                  <TableCell className="font-medium text-blue-700">
+                                    {enrollStats?.total ?? 0}
                                   </TableCell>
-                                  {deanExamRegDataUploaded && (
-                                    <>
-                                      <TableCell>
-                                        <span className="text-green-700 font-medium">
-                                          {stats?.done ?? 0}
-                                        </span>
-                                      </TableCell>
-                                      <TableCell>
-                                        <span className="text-red-600 font-medium">
-                                          {stats?.doFirst ?? 0}
-                                        </span>
-                                      </TableCell>
-                                    </>
-                                  )}
-                                  <TableCell>
+                                  <TableCell className="border-r">
                                     {eErr > 0 ? (
                                       <Badge
                                         variant="destructive"
@@ -806,22 +1015,38 @@ export default function DeanDashboard() {
                                       </span>
                                     )}
                                   </TableCell>
-                                  {deanExamRegDataUploaded && (
-                                    <TableCell>
-                                      {rErr > 0 ? (
-                                        <Badge
-                                          variant="destructive"
-                                          className="text-xs"
-                                        >
-                                          {rErr}
-                                        </Badge>
-                                      ) : (
-                                        <span className="text-green-600 text-sm">
-                                          0
-                                        </span>
-                                      )}
-                                    </TableCell>
-                                  )}
+                                  <TableCell className="font-medium text-purple-700">
+                                    {examTotal}
+                                  </TableCell>
+                                  <TableCell>
+                                    <span className="text-green-700 font-medium">
+                                      {examStats?.done ?? 0}
+                                    </span>
+                                  </TableCell>
+                                  <TableCell>
+                                    <span className="text-amber-600 font-medium">
+                                      {examStats?.redo ?? 0}
+                                    </span>
+                                  </TableCell>
+                                  <TableCell>
+                                    <span className="text-red-600 font-medium">
+                                      {examStats?.doFirst ?? 0}
+                                    </span>
+                                  </TableCell>
+                                  <TableCell>
+                                    {rErr > 0 ? (
+                                      <Badge
+                                        variant="destructive"
+                                        className="text-xs"
+                                      >
+                                        {rErr}
+                                      </Badge>
+                                    ) : (
+                                      <span className="text-green-600 text-sm">
+                                        0
+                                      </span>
+                                    )}
+                                  </TableCell>
                                 </TableRow>
                               );
                             })}
@@ -852,16 +1077,16 @@ export default function DeanDashboard() {
                     </Button>
                   </div>
                 )}
-                {/* Student Enrollment Data Upload */}
+                {/* NPTEL Enrollment Data */}
                 <Card>
                   <CardHeader>
                     <CardTitle className="font-display text-base flex items-center gap-2">
                       <Upload className="h-4 w-4 text-primary" />
-                      Student Enrollment Data Upload
+                      NPTEL Enrollment Data
                     </CardTitle>
                     <CardDescription>
-                      Upload student enrollment CSV/Excel file. This will
-                      populate student records and detect enrollment errors.
+                      Upload NPTEL enrollment CSV/Excel files. Multiple uploads
+                      supported — each upload appends records.
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -944,20 +1169,102 @@ export default function DeanDashboard() {
                       onChange={handleStudentDataUpload}
                       data-ocid="dean.student_upload.upload_button"
                     />
+                    {/* Previous Files Selector */}
+                    {enrollmentFileSnapshots.length > 0 && (
+                      <div className="mt-4 p-3 rounded-lg border bg-muted/30">
+                        <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1">
+                          <FileText className="h-3.5 w-3.5" /> Previous
+                          Enrollment Files
+                        </p>
+                        <div className="space-y-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setSelectedEnrollmentSnapshotIdx(null)
+                            }
+                            className={`w-full flex items-center justify-between p-2 rounded cursor-pointer text-xs ${selectedEnrollmentSnapshotIdx === null ? "bg-primary/10 border border-primary/30 font-medium" : "hover:bg-muted/50"}`}
+                          >
+                            <span>Latest (current)</span>
+                            <Badge variant="outline" className="text-xs">
+                              Active
+                            </Badge>
+                          </button>
+                          {enrollmentFileSnapshots.map((snap, idx) => (
+                            <div
+                              key={snap.timestamp}
+                              className={`w-full flex items-center justify-between p-2 rounded text-xs ${selectedEnrollmentSnapshotIdx === idx ? "bg-amber-50 border border-amber-300 font-medium" : "hover:bg-muted/50"}`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSelectedEnrollmentSnapshotIdx(idx)
+                                }
+                                className="flex items-center gap-1 flex-1 truncate text-left cursor-pointer"
+                              >
+                                <span className="truncate flex-1">
+                                  {snap.fileName}
+                                </span>
+                                <span className="text-muted-foreground ml-2 shrink-0">
+                                  {new Date(
+                                    snap.timestamp,
+                                  ).toLocaleDateString()}
+                                </span>
+                              </button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-xs ml-2 shrink-0 border-blue-300 text-blue-600 hover:bg-blue-50"
+                                onClick={() => {
+                                  setUploadedStudentRecords(snap.records);
+                                  setEnrollmentErrors(
+                                    snap.errors as EnrollmentError[],
+                                  );
+                                  setSelectedEnrollmentSnapshotIdx(null);
+                                  toast.success(
+                                    `Restored enrollment data from "${snap.fileName}"`,
+                                  );
+                                }}
+                              >
+                                Restore
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                        {selectedEnrollmentSnapshotIdx !== null && (
+                          <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800">
+                            ⚠️ Viewing historical data from{" "}
+                            <strong>
+                              {
+                                enrollmentFileSnapshots[
+                                  selectedEnrollmentSnapshotIdx
+                                ]?.fileName
+                              }
+                            </strong>{" "}
+                            uploaded on{" "}
+                            {new Date(
+                              enrollmentFileSnapshots[
+                                selectedEnrollmentSnapshotIdx
+                              ]?.timestamp,
+                            ).toLocaleString()}
+                            . This is not the current active data.
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
 
-                {/* Student Exam Registration Data Upload — active in parallel with enrollment */}
+                {/* NPTEL Exam Registration Data — active in parallel with enrollment */}
                 <Card>
                   <CardHeader>
                     <CardTitle className="font-display text-base flex items-center gap-2">
                       <FileText className="h-4 w-4 text-primary" />
-                      Student Exam Registration Data Upload
+                      NPTEL Exam Registration Data
                     </CardTitle>
                     <CardDescription>
-                      Upload exam registration CSV/Excel file. This will
-                      populate exam registration details and detect payment
-                      errors. Can be uploaded in parallel with enrollment data.
+                      Upload NPTEL exam registration CSV/Excel files. Payment
+                      status and exam details — upload in parallel with
+                      enrollment.
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -1024,6 +1331,83 @@ export default function DeanDashboard() {
                       onChange={handleExamRegUpload}
                       data-ocid="dean.exam_upload.upload_button"
                     />
+                    {/* Previous Files Selector */}
+                    {examRegFileSnapshots.length > 0 && (
+                      <div className="mt-4 p-3 rounded-lg border bg-muted/30">
+                        <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1">
+                          <FileText className="h-3.5 w-3.5" /> Previous Exam Reg
+                          Files
+                        </p>
+                        <div className="space-y-1">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedExamRegSnapshotIdx(null)}
+                            className={`w-full flex items-center justify-between p-2 rounded cursor-pointer text-xs ${selectedExamRegSnapshotIdx === null ? "bg-primary/10 border border-primary/30 font-medium" : "hover:bg-muted/50"}`}
+                          >
+                            <span>Latest (current)</span>
+                            <Badge variant="outline" className="text-xs">
+                              Active
+                            </Badge>
+                          </button>
+                          {examRegFileSnapshots.map((snap, idx) => (
+                            <div
+                              key={snap.timestamp}
+                              className={`w-full flex items-center justify-between p-2 rounded text-xs ${selectedExamRegSnapshotIdx === idx ? "bg-amber-50 border border-amber-300 font-medium" : "hover:bg-muted/50"}`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSelectedExamRegSnapshotIdx(idx)
+                                }
+                                className="flex items-center gap-1 flex-1 truncate text-left cursor-pointer"
+                              >
+                                <span className="truncate flex-1">
+                                  {snap.fileName}
+                                </span>
+                                <span className="text-muted-foreground ml-2 shrink-0">
+                                  {new Date(
+                                    snap.timestamp,
+                                  ).toLocaleDateString()}
+                                </span>
+                              </button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-xs ml-2 shrink-0 border-blue-300 text-blue-600 hover:bg-blue-50"
+                                onClick={() => {
+                                  setExamRegErrors(
+                                    snap.errors as ExamRegError[],
+                                  );
+                                  setSelectedExamRegSnapshotIdx(null);
+                                  toast.success(
+                                    `Restored exam reg data from "${snap.fileName}"`,
+                                  );
+                                }}
+                              >
+                                Restore
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                        {selectedExamRegSnapshotIdx !== null && (
+                          <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800">
+                            ⚠️ Viewing historical data from{" "}
+                            <strong>
+                              {
+                                examRegFileSnapshots[selectedExamRegSnapshotIdx]
+                                  ?.fileName
+                              }
+                            </strong>{" "}
+                            uploaded on{" "}
+                            {new Date(
+                              examRegFileSnapshots[selectedExamRegSnapshotIdx]
+                                ?.timestamp,
+                            ).toLocaleString()}
+                            . This is not the current active data.
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
 
@@ -2120,6 +2504,20 @@ export default function DeanDashboard() {
                               ))}
                             </SelectContent>
                           </Select>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8 gap-1 text-xs"
+                            data-ocid="dean.errors.download_button"
+                            onClick={() =>
+                              downloadErrorsAsExcel(
+                                filteredErrors,
+                                `all-errors-${new Date().toISOString().slice(0, 10)}.xlsx`,
+                              )
+                            }
+                          >
+                            <Download className="h-3 w-3" /> Download
+                          </Button>
                         </div>
                       </div>
                     </CardHeader>
@@ -2159,6 +2557,7 @@ export default function DeanDashboard() {
                                   <TableHead>Student ID</TableHead>
                                   <TableHead>Email</TableHead>
                                   <TableHead>Course ID</TableHead>
+                                  <TableHead>Course Name</TableHead>
                                   <TableHead>Error Type</TableHead>
                                   <TableHead>Details</TableHead>
                                 </TableRow>
@@ -2198,6 +2597,9 @@ export default function DeanDashboard() {
                                     <TableCell className="font-mono text-sm">
                                       {err.courseId}
                                     </TableCell>
+                                    <TableCell className="text-sm max-w-xs truncate">
+                                      {err.courseName || "-"}
+                                    </TableCell>
                                     <TableCell>
                                       <Badge
                                         variant="destructive"
@@ -2206,8 +2608,24 @@ export default function DeanDashboard() {
                                         {err.errorType}
                                       </Badge>
                                     </TableCell>
-                                    <TableCell className="text-sm text-muted-foreground max-w-xs truncate">
-                                      {err.details}
+                                    <TableCell>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        onClick={() =>
+                                          setViewErrorDeanDialog({
+                                            details: err.details,
+                                            courseName: err.courseName,
+                                            courseId: err.courseId,
+                                            errorType: err.errorType,
+                                            studentId: err.studentId,
+                                          })
+                                        }
+                                        className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
+                                        data-ocid="dean.errors.view_button"
+                                      >
+                                        <Eye className="h-3 w-3" /> View
+                                      </Button>
                                     </TableCell>
                                   </TableRow>
                                 ))}
@@ -2432,6 +2850,94 @@ export default function DeanDashboard() {
                       )}
                     </CardContent>
                   </Card>
+                  {/* Cross-match Errors */}
+                  {crossMatchErrors.length > 0 && (
+                    <Card className="border-orange-200">
+                      <CardHeader>
+                        <CardTitle className="font-display text-base flex items-center gap-2">
+                          <AlertCircle className="h-4 w-4 text-orange-500" />
+                          Cross-match Errors (Enrollment vs Exam Registration)
+                          <Badge className="bg-orange-100 text-orange-700 border-orange-300">
+                            {crossMatchErrors.length}
+                          </Badge>
+                        </CardTitle>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Students enrolled in 12-week courses without exam
+                          registration, or exam registered without enrollment
+                        </p>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="rounded-lg border overflow-x-auto">
+                          <Table>
+                            <TableHeader>
+                              <TableRow className="bg-muted/50">
+                                <TableHead>Student ID</TableHead>
+                                <TableHead>Email</TableHead>
+                                <TableHead>Course Name</TableHead>
+                                <TableHead>Course ID</TableHead>
+                                <TableHead>Error Type</TableHead>
+                                <TableHead>Description</TableHead>
+                                <TableHead>Branch</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {crossMatchErrors.slice(0, 100).map((err, i) => (
+                                <TableRow
+                                  key={`cm-${err.studentId}-${err.courseId}-${err.errorType}`}
+                                  data-ocid={`dean.crossmatch.row.${i + 1}`}
+                                >
+                                  <TableCell className="font-mono text-xs">
+                                    {err.studentId}
+                                  </TableCell>
+                                  <TableCell className="text-xs">
+                                    {err.email}
+                                  </TableCell>
+                                  <TableCell>
+                                    <span className="font-semibold text-primary text-xs">
+                                      {err.courseName || "-"}
+                                    </span>
+                                  </TableCell>
+                                  <TableCell className="font-mono text-xs">
+                                    {err.courseId}
+                                  </TableCell>
+                                  <TableCell>
+                                    <Badge
+                                      variant={
+                                        err.errorType ===
+                                        "Missing Exam Registration"
+                                          ? "destructive"
+                                          : "outline"
+                                      }
+                                      className="text-xs whitespace-nowrap"
+                                    >
+                                      {err.errorType}
+                                    </Badge>
+                                  </TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">
+                                    {err.details}
+                                  </TableCell>
+                                  <TableCell>
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {err.branch}
+                                    </Badge>
+                                  </TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </div>
+                        {crossMatchErrors.length > 100 && (
+                          <p className="text-xs text-muted-foreground mt-2">
+                            Showing first 100 of {crossMatchErrors.length}{" "}
+                            cross-match errors.
+                          </p>
+                        )}
+                      </CardContent>
+                    </Card>
+                  )}
                 </div>
               )}
             </TabsContent>
@@ -2513,6 +3019,20 @@ export default function DeanDashboard() {
                               ))}
                             </SelectContent>
                           </Select>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8 gap-1 text-xs"
+                            data-ocid="dean.enrollment_errors.download_button"
+                            onClick={() =>
+                              downloadErrorsAsExcel(
+                                filteredEnrollErrors,
+                                `enrollment-errors-${new Date().toISOString().slice(0, 10)}.xlsx`,
+                              )
+                            }
+                          >
+                            <Download className="h-3 w-3" /> Download
+                          </Button>
                         </div>
                       </div>
                     </CardHeader>
@@ -2570,6 +3090,9 @@ export default function DeanDashboard() {
                                     Course ID
                                   </TableHead>
                                   <TableHead className="text-blue-700">
+                                    Course Name
+                                  </TableHead>
+                                  <TableHead className="text-blue-700">
                                     Error Type
                                   </TableHead>
                                   <TableHead className="text-blue-700">
@@ -2605,6 +3128,9 @@ export default function DeanDashboard() {
                                     <TableCell className="font-mono text-sm">
                                       {err.courseId}
                                     </TableCell>
+                                    <TableCell className="text-sm max-w-xs truncate">
+                                      {err.courseName || "-"}
+                                    </TableCell>
                                     <TableCell>
                                       <Badge
                                         variant="destructive"
@@ -2613,8 +3139,24 @@ export default function DeanDashboard() {
                                         {err.errorType}
                                       </Badge>
                                     </TableCell>
-                                    <TableCell className="text-sm text-muted-foreground max-w-xs truncate">
-                                      {err.details}
+                                    <TableCell>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        onClick={() =>
+                                          setViewErrorDeanDialog({
+                                            details: err.details,
+                                            courseName: err.courseName,
+                                            courseId: err.courseId,
+                                            errorType: err.errorType,
+                                            studentId: err.studentId,
+                                          })
+                                        }
+                                        className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
+                                        data-ocid="dean.enrollment_errors.view_button"
+                                      >
+                                        <Eye className="h-3 w-3" /> View
+                                      </Button>
                                     </TableCell>
                                   </TableRow>
                                 ))}
@@ -2739,6 +3281,20 @@ export default function DeanDashboard() {
                               ))}
                             </SelectContent>
                           </Select>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8 gap-1 text-xs"
+                            data-ocid="dean.examreg_errors.download_button"
+                            onClick={() =>
+                              downloadErrorsAsExcel(
+                                filteredExamRegErrList,
+                                `examreg-errors-${new Date().toISOString().slice(0, 10)}.xlsx`,
+                              )
+                            }
+                          >
+                            <Download className="h-3 w-3" /> Download
+                          </Button>
                         </div>
                       </div>
                     </CardHeader>
@@ -2795,6 +3351,9 @@ export default function DeanDashboard() {
                                     Course ID
                                   </TableHead>
                                   <TableHead className="text-purple-700">
+                                    Course Name
+                                  </TableHead>
+                                  <TableHead className="text-purple-700">
                                     Payment Status
                                   </TableHead>
                                   <TableHead className="text-purple-700">
@@ -2833,6 +3392,9 @@ export default function DeanDashboard() {
                                     <TableCell className="font-mono text-sm">
                                       {err.courseId}
                                     </TableCell>
+                                    <TableCell className="text-sm max-w-xs truncate">
+                                      {err.courseName || "-"}
+                                    </TableCell>
                                     <TableCell>
                                       <Badge
                                         variant="outline"
@@ -2849,8 +3411,24 @@ export default function DeanDashboard() {
                                         {err.errorType}
                                       </Badge>
                                     </TableCell>
-                                    <TableCell className="text-sm text-muted-foreground max-w-xs truncate">
-                                      {err.details}
+                                    <TableCell>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        onClick={() =>
+                                          setViewErrorDeanDialog({
+                                            details: err.details ?? "",
+                                            courseName: err.courseName,
+                                            courseId: (err as any).courseId,
+                                            errorType: err.errorType,
+                                            studentId: err.studentId,
+                                          })
+                                        }
+                                        className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
+                                        data-ocid="dean.examreg_errors.view_button"
+                                      >
+                                        <Eye className="h-3 w-3" /> View
+                                      </Button>
                                     </TableCell>
                                   </TableRow>
                                 ))}
@@ -2898,6 +3476,72 @@ export default function DeanDashboard() {
           </Tabs>
         </motion.div>
       </main>
+      {/* View Error Details Dialog - Dean */}
+      {viewErrorDeanDialog && (
+        <Dialog open={true} onOpenChange={() => setViewErrorDeanDialog(null)}>
+          <DialogContent
+            className="max-w-md"
+            data-ocid="dean.view_error.dialog"
+          >
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 text-red-700">
+                <Eye className="h-4 w-4" />
+                Error Details
+              </DialogTitle>
+            </DialogHeader>
+            <div className="space-y-3 text-sm">
+              {viewErrorDeanDialog.courseName && (
+                <div>
+                  <span className="font-semibold text-foreground">
+                    Course Name:{" "}
+                  </span>
+                  <span className="font-bold text-blue-700">
+                    {viewErrorDeanDialog.courseName}
+                  </span>
+                </div>
+              )}
+              {viewErrorDeanDialog.courseId && (
+                <div>
+                  <span className="font-semibold text-foreground">
+                    Course ID:{" "}
+                  </span>
+                  <span className="font-mono">
+                    {viewErrorDeanDialog.courseId}
+                  </span>
+                </div>
+              )}
+              {viewErrorDeanDialog.errorType && (
+                <div>
+                  <span className="font-semibold text-foreground">
+                    Error Type:{" "}
+                  </span>
+                  <Badge variant="destructive" className="text-xs">
+                    {viewErrorDeanDialog.errorType}
+                  </Badge>
+                </div>
+              )}
+              <div>
+                <span className="font-semibold text-foreground">
+                  Description:{" "}
+                </span>
+                <span className="text-muted-foreground">
+                  {viewErrorDeanDialog.details}
+                </span>
+              </div>
+              {viewErrorDeanDialog.studentId && (
+                <div>
+                  <span className="font-semibold text-foreground">
+                    Student ID:{" "}
+                  </span>
+                  <span className="font-mono">
+                    {viewErrorDeanDialog.studentId}
+                  </span>
+                </div>
+              )}
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }

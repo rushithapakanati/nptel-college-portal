@@ -524,16 +524,30 @@ export default function StudentDashboard() {
                           {myEnrollmentErrors.map((err, i) => (
                             <div
                               key={err.id}
-                              className="flex items-start gap-2 text-sm"
+                              className="rounded border border-red-200 bg-red-50 p-3 text-sm"
                               data-ocid={`student.enrollment.error.${i + 1}`}
                             >
-                              <Badge
-                                variant="destructive"
-                                className="text-xs shrink-0 mt-0.5"
-                              >
-                                {err.errorType}
-                              </Badge>
-                              <span className="text-red-700">
+                              <div className="flex flex-wrap items-center gap-2 mb-2">
+                                {err.courseName && (
+                                  <span className="font-bold text-blue-800 bg-blue-50 border border-blue-200 rounded px-2 py-0.5">
+                                    {err.courseName}
+                                  </span>
+                                )}
+                                <Badge
+                                  variant="destructive"
+                                  className="text-xs shrink-0"
+                                >
+                                  {err.errorType}
+                                </Badge>
+                              </div>
+                              <div className="flex flex-wrap gap-2 mb-1">
+                                {err.courseId && (
+                                  <span className="text-xs font-mono bg-white border border-red-200 rounded px-1 py-0.5 text-gray-600">
+                                    ID: {err.courseId}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-red-700 text-xs">
                                 {err.details}
                               </span>
                             </div>
@@ -799,16 +813,30 @@ export default function StudentDashboard() {
                           {myExamRegErrors.map((err, i) => (
                             <div
                               key={err.id}
-                              className="flex items-start gap-2 text-sm"
+                              className="rounded border border-red-200 bg-red-50 p-3 text-sm"
                               data-ocid={`student.exam_reg.error.${i + 1}`}
                             >
-                              <Badge
-                                variant="destructive"
-                                className="text-xs shrink-0 mt-0.5"
-                              >
-                                {err.errorType}
-                              </Badge>
-                              <span className="text-red-700">
+                              <div className="flex flex-wrap items-center gap-2 mb-2">
+                                {err.courseName && (
+                                  <span className="font-bold text-blue-800 bg-blue-50 border border-blue-200 rounded px-2 py-0.5">
+                                    {err.courseName}
+                                  </span>
+                                )}
+                                <Badge
+                                  variant="destructive"
+                                  className="text-xs shrink-0"
+                                >
+                                  {err.errorType}
+                                </Badge>
+                              </div>
+                              <div className="flex flex-wrap gap-2 mb-1">
+                                {err.courseId && (
+                                  <span className="text-xs font-mono bg-white border border-red-200 rounded px-1 py-0.5 text-gray-600">
+                                    ID: {err.courseId}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-red-700 text-xs">
                                 {err.details}
                               </span>
                             </div>
@@ -875,7 +903,7 @@ export default function StudentDashboard() {
                                 #
                               </TableHead>
                               <TableHead className="text-indigo-700">
-                                Student ID
+                                Roll No
                               </TableHead>
                               <TableHead className="text-indigo-700">
                                 Email ID
@@ -895,6 +923,13 @@ export default function StudentDashboard() {
                               <TableHead className="text-indigo-700">
                                 Time Slot
                               </TableHead>
+                              {myShuffleRecords.some(
+                                (r) => r.seatingNumber,
+                              ) && (
+                                <TableHead className="text-indigo-700">
+                                  Seating No
+                                </TableHead>
+                              )}
                               {myShuffleRecords.some((r) => r.hallTicketNo) && (
                                 <TableHead className="text-indigo-700">
                                   Hall Ticket
@@ -938,6 +973,13 @@ export default function StudentDashboard() {
                                     {row.examSlot || "-"}
                                   </Badge>
                                 </TableCell>
+                                {myShuffleRecords.some(
+                                  (r) => r.seatingNumber,
+                                ) && (
+                                  <TableCell className="font-mono text-sm">
+                                    {row.seatingNumber || "-"}
+                                  </TableCell>
+                                )}
                                 {myShuffleRecords.some(
                                   (r) => r.hallTicketNo,
                                 ) && (

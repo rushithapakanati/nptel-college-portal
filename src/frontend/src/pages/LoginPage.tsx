@@ -131,7 +131,8 @@ export default function LoginPage() {
     : "";
   const role = (params.role ?? "student") as "student" | "hod" | "dean";
 
-  const { setCurrentUser } = useAppContext();
+  const { setCurrentUser, uploadedStudentRecords, hodUploadedRecords } =
+    useAppContext();
 
   const campusKey = normalizeCampusKey(collegeName);
 
@@ -196,18 +197,33 @@ export default function LoginPage() {
       if (role === "student") {
         // Validate email format for the specific campus
         if (!emailPattern.test(email)) {
-          setError(
-            `Please use your ${collegeName} college email (e.g., ${emailExample})`,
+          // Fallback: check if the email exists in uploaded data (personal email support)
+          const allRecords = [...uploadedStudentRecords, ...hodUploadedRecords];
+          const foundInData = allRecords.find(
+            (r) => r.email.toLowerCase() === email.toLowerCase(),
           );
+          if (!foundInData) {
+            setError(
+              `Please use your ${collegeName} college/personal email (e.g., ${emailExample})`,
+            );
+            return;
+          }
+          // Found in uploaded data — allow login with personal email
+          const studentId = email.split("@")[0];
+          const storedPassword = loadStudentPassword(campusKey, studentId);
+          if (password !== storedPassword) {
+            setError("Incorrect password.");
+            return;
+          }
+          setCurrentUser({ role: "student", college: collegeName, email });
+          navigate({
+            to: `/college/${encodeURIComponent(collegeName)}/student`,
+          });
           return;
         }
         const studentId = email.split("@")[0];
-        if (!studentId.toLowerCase().startsWith(idPrefix)) {
-          setError(
-            `Student ID must start with "${idPrefix.toUpperCase()}" for ${collegeName} campus. E.g., ${emailExample}`,
-          );
-          return;
-        }
+        // emailPattern already validates prefix; skip redundant startsWith check
+        // so double-prefixes like rr, rs, ro also pass
         const storedPassword = loadStudentPassword(campusKey, studentId);
         if (password !== storedPassword) {
           setError("Incorrect password.");
@@ -703,7 +719,7 @@ export default function LoginPage() {
       <form onSubmit={handleLogin} className="p-8 space-y-5">
         <div className="space-y-1.5">
           <Label htmlFor="email-input" className="font-medium">
-            College Email
+            College Email / Personal Email
           </Label>
           <Input
             id="email-input"

@@ -7,6 +7,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -28,7 +34,10 @@ import { useNavigate, useParams } from "@tanstack/react-router";
 import {
   AlertCircle,
   ArrowLeft,
+  BookOpen,
   CheckCircle2,
+  Download,
+  Eye,
   FileText,
   Filter,
   Lock,
@@ -53,11 +62,37 @@ import type {
   HodEditedRecord,
 } from "../data/mockData";
 import {
+  loadXLSXLib,
   parseExamRegRecords,
   parseUploadedFile,
   validateEnrollmentRows,
   validateExamRegRows,
 } from "../utils/fileParser";
+
+async function downloadErrorsAsExcel<
+  T extends {
+    studentId: string;
+    email: string;
+    courseId: string;
+    courseName?: string;
+    errorType: string;
+    details?: string;
+  },
+>(errors: T[], filename: string) {
+  const XLSX = await loadXLSXLib();
+  const rows = errors.map((e) => ({
+    "Student ID": e.studentId,
+    Email: e.email,
+    "Course ID": e.courseId,
+    "Course Name": e.courseName || "",
+    "Error Type": e.errorType,
+    Description: e.details || "",
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Errors");
+  XLSX.writeFile(wb, filename);
+}
 
 export default function HODDashboard() {
   const navigate = useNavigate();
@@ -86,6 +121,10 @@ export default function HODDashboard() {
     appendHodUploadedRecords,
     hodUploadedRecords,
     uploadedCourses,
+    enrollmentFileSnapshots,
+    addEnrollmentSnapshot,
+    examRegFileSnapshots,
+    addExamRegSnapshot,
     logout,
   } = useAppContext();
 
@@ -94,6 +133,15 @@ export default function HODDashboard() {
     setRefreshKey((k) => k + 1);
     toast.success("Dashboard refreshed.");
   }
+
+  // ── 12-week courses pagination ──
+  const [coursePage, setCoursePage] = useState(1);
+  const COURSE_PAGE_SIZE = 50;
+  // ── Snapshot selection ──
+  const [selectedHodEnrollSnapshotIdx, setSelectedHodEnrollSnapshotIdx] =
+    useState<number | null>(null);
+  const [selectedHodExamRegSnapshotIdx, setSelectedHodExamRegSnapshotIdx] =
+    useState<number | null>(null);
 
   const permissions = hodPermissions[branch];
   const branchEnrollErrors = enrollmentErrors.filter(
@@ -126,10 +174,21 @@ export default function HODDashboard() {
   // Edit state
   const [editingEnrollId, setEditingEnrollId] = useState<string | null>(null);
   const [editingExamId, setEditingExamId] = useState<string | null>(null);
+  // View/Edit dialog state
+  const [viewErrorDialog, setViewErrorDialog] = useState<{
+    type: "enroll" | "exam";
+    id: string;
+  } | null>(null);
+  const [editDialogEnroll, setEditDialogEnroll] = useState<string | null>(null);
+  const [editDialogExam, setEditDialogExam] = useState<string | null>(null);
   const [editEnrollForm, setEditEnrollForm] = useState<
     Partial<EnrollmentError>
   >({});
   const [editExamForm, setEditExamForm] = useState<Partial<ExamRegError>>({});
+
+  // Bulk edit mode states
+  const [enrollEditMode, setEnrollEditMode] = useState(false);
+  const [examEditMode, setExamEditMode] = useState(false);
 
   // Error type filter state
   const [enrollErrorTypeFilter, setEnrollErrorTypeFilter] =
@@ -215,6 +274,14 @@ export default function HODDashboard() {
       // Append to campus-wide errors and student records
       appendEnrollmentErrors(errors);
       appendHodUploadedRecords(records);
+      // Save snapshot for versioning
+      addEnrollmentSnapshot({
+        fileName: file.name,
+        records,
+        errors,
+        timestamp: Date.now(),
+      });
+      setSelectedHodEnrollSnapshotIdx(null);
       toast.success(
         `Enrollment file "${file.name}" parsed: ${records.length} records, ${errors.length} errors found. Credits remaining: ${permissions.enrollmentEdits - 1}`,
       );
@@ -273,6 +340,14 @@ export default function HODDashboard() {
       // Append errors and exam records to campus state
       appendExamRegErrors(examErrors);
       appendHodUploadedRecords(examRecords);
+      // Save snapshot for versioning
+      addExamRegSnapshot({
+        fileName: file.name,
+        records: examRecords,
+        errors: examErrors,
+        timestamp: Date.now(),
+      });
+      setSelectedHodExamRegSnapshotIdx(null);
       toast.success(
         `Exam reg file "${file.name}" parsed: ${examRecords.length} records, ${examErrors.length} errors found. Credits remaining: ${permissions.examRegEdits - 1}`,
       );
@@ -294,6 +369,7 @@ export default function HODDashboard() {
     toast.info(`File "${fileName}" removed.`);
   }
 
+  // biome-ignore lint/correctness/noUnusedVariables: kept for potential reuse
   function startEditEnroll(err: EnrollmentError) {
     if (permissions.enrollmentEdits <= 0) {
       toast.error("No edit credits remaining. Ask Dean for more.");
@@ -310,9 +386,7 @@ export default function HODDashboard() {
   function saveEditEnroll(id: string) {
     const origErr = filteredEnrollErrors.find((e) => e.id === id);
     updateEnrollmentError(id, { ...editEnrollForm, edited: true });
-    updateHodPermission(branch, {
-      enrollmentEdits: Math.max(0, permissions.enrollmentEdits - 1),
-    });
+    // Credits consumed only on "End Editing / Save All", not per-row
     if (origErr) {
       const editRecord: HodEditedRecord = {
         id,
@@ -333,6 +407,7 @@ export default function HODDashboard() {
     toast.success("Enrollment record updated.");
   }
 
+  // biome-ignore lint/correctness/noUnusedVariables: kept for potential reuse
   function startEditExam(err: ExamRegError) {
     if (permissions.examRegEdits <= 0) {
       toast.error("No exam reg edit credits remaining. Ask Dean for more.");
@@ -349,9 +424,7 @@ export default function HODDashboard() {
   function saveEditExam(id: string) {
     const origErr = filteredExamErrors.find((e) => e.id === id);
     updateExamRegError(id, { ...editExamForm, edited: true });
-    updateHodPermission(branch, {
-      examRegEdits: Math.max(0, permissions.examRegEdits - 1),
-    });
+    // Credits consumed only on "End Editing / Save All", not per-row
     if (origErr) {
       const editRecord: HodEditedRecord = {
         id,
@@ -576,6 +649,47 @@ export default function HODDashboard() {
                           onChange={handleEnrollUpload}
                           data-ocid="hod.enrollment.upload_button"
                         />
+                        {/* Previous Files Selector */}
+                        {enrollmentFileSnapshots.length > 0 && (
+                          <div className="mt-3 p-3 rounded-lg border bg-muted/30">
+                            <p className="text-xs font-semibold text-muted-foreground mb-2">
+                              Previous Enrollment Files
+                            </p>
+                            <div className="space-y-1">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setSelectedHodEnrollSnapshotIdx(null)
+                                }
+                                className={`w-full flex items-center justify-between p-2 rounded cursor-pointer text-xs ${selectedHodEnrollSnapshotIdx === null ? "bg-primary/10 border border-primary/30 font-medium" : "hover:bg-muted/50"}`}
+                              >
+                                <span>Latest (current)</span>
+                                <Badge variant="outline" className="text-xs">
+                                  Active
+                                </Badge>
+                              </button>
+                              {enrollmentFileSnapshots.map((snap, idx) => (
+                                <button
+                                  type="button"
+                                  key={snap.timestamp}
+                                  onClick={() =>
+                                    setSelectedHodEnrollSnapshotIdx(idx)
+                                  }
+                                  className={`w-full flex items-center justify-between p-2 rounded cursor-pointer text-xs ${selectedHodEnrollSnapshotIdx === idx ? "bg-amber-50 border border-amber-300 font-medium" : "hover:bg-muted/50"}`}
+                                >
+                                  <span className="truncate flex-1">
+                                    {snap.fileName}
+                                  </span>
+                                  <span className="text-muted-foreground ml-2">
+                                    {new Date(
+                                      snap.timestamp,
+                                    ).toLocaleDateString()}
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-50 border border-amber-200">
@@ -732,6 +846,56 @@ export default function HODDashboard() {
                         ))}
                       </SelectContent>
                     </Select>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 gap-1 text-xs"
+                      data-ocid="hod.enrollment_errors.download_button"
+                      onClick={() =>
+                        downloadErrorsAsExcel(
+                          filteredEnrollErrors,
+                          `enrollment-errors-${branch}-${new Date().toISOString().slice(0, 10)}.xlsx`,
+                        )
+                      }
+                    >
+                      <Download className="h-3 w-3" /> Download
+                    </Button>
+                    {enrollEditMode ? (
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        className="h-8 gap-1 text-xs"
+                        data-ocid="hod.enrollment_errors.end_editing_button"
+                        onClick={() => {
+                          updateHodPermission(branch, {
+                            enrollmentEdits: Math.max(
+                              0,
+                              permissions.enrollmentEdits - 1,
+                            ),
+                          });
+                          setEnrollEditMode(false);
+                          toast.success("Edit session ended. 1 credit used.");
+                        }}
+                      >
+                        <Save className="h-3 w-3" /> End Editing / Save All
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8 gap-1 text-xs"
+                        data-ocid="hod.enrollment_errors.enable_editing_button"
+                        disabled={permissions.enrollmentEdits <= 0}
+                        title={
+                          permissions.enrollmentEdits <= 0
+                            ? "No edit credits. Ask Dean for more."
+                            : "Enable editing for all rows"
+                        }
+                        onClick={() => setEnrollEditMode(true)}
+                      >
+                        <PenLine className="h-3 w-3" /> Enable Editing
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>
@@ -776,9 +940,9 @@ export default function HODDashboard() {
                         <TableHead>Student ID</TableHead>
                         <TableHead>Email</TableHead>
                         <TableHead>Course ID</TableHead>
+                        <TableHead>Course Name</TableHead>
                         <TableHead>Error Type</TableHead>
                         <TableHead>Details</TableHead>
-                        <TableHead>Status</TableHead>
                         <TableHead>Action</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -870,6 +1034,9 @@ export default function HODDashboard() {
                               <TableCell className="font-mono text-sm">
                                 {err.courseId}
                               </TableCell>
+                              <TableCell className="text-sm max-w-xs truncate">
+                                {err.courseName || "-"}
+                              </TableCell>
                               <TableCell>
                                 <Badge
                                   variant="destructive"
@@ -878,31 +1045,42 @@ export default function HODDashboard() {
                                   {err.errorType}
                                 </Badge>
                               </TableCell>
-                              <TableCell className="text-sm text-muted-foreground max-w-xs truncate">
-                                {err.details}
-                              </TableCell>
-                              <TableCell>
-                                {err.edited ? (
-                                  <Badge className="bg-green-100 text-green-700 text-xs">
-                                    Edited
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="outline" className="text-xs">
-                                    Pending
-                                  </Badge>
-                                )}
-                              </TableCell>
                               <TableCell>
                                 <Button
                                   size="sm"
-                                  variant="outline"
-                                  onClick={() => startEditEnroll(err)}
-                                  disabled={permissions.enrollmentEdits <= 0}
-                                  className="h-7 px-2 gap-1"
-                                  data-ocid={`hod.enrollment_errors.edit_button.${i + 1}`}
+                                  variant="ghost"
+                                  onClick={() =>
+                                    setViewErrorDialog({
+                                      type: "enroll",
+                                      id: err.id,
+                                    })
+                                  }
+                                  className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
+                                  data-ocid={`hod.enrollment_errors.view_button.${i + 1}`}
                                 >
-                                  <PenLine className="h-3 w-3" /> Edit
+                                  <Eye className="h-3 w-3" /> View
                                 </Button>
+                              </TableCell>
+                              <TableCell>
+                                <div className="flex gap-1">
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => {
+                                      setEditDialogEnroll(err.id);
+                                      setEditEnrollForm({
+                                        studentId: err.studentId,
+                                        email: err.email,
+                                        courseId: err.courseId,
+                                      });
+                                    }}
+                                    disabled={!enrollEditMode}
+                                    className="h-7 px-2 gap-1"
+                                    data-ocid={`hod.enrollment_errors.edit_button.${i + 1}`}
+                                  >
+                                    <PenLine className="h-3 w-3" /> Edit
+                                  </Button>
+                                </div>
                               </TableCell>
                             </>
                           )}
@@ -1007,6 +1185,56 @@ export default function HODDashboard() {
                         ))}
                       </SelectContent>
                     </Select>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 gap-1 text-xs"
+                      data-ocid="hod.exam_reg_errors.download_button"
+                      onClick={() =>
+                        downloadErrorsAsExcel(
+                          filteredExamErrors,
+                          `examreg-errors-${branch}-${new Date().toISOString().slice(0, 10)}.xlsx`,
+                        )
+                      }
+                    >
+                      <Download className="h-3 w-3" /> Download
+                    </Button>
+                    {examEditMode ? (
+                      <Button
+                        size="sm"
+                        variant="destructive"
+                        className="h-8 gap-1 text-xs"
+                        data-ocid="hod.exam_reg_errors.end_editing_button"
+                        onClick={() => {
+                          updateHodPermission(branch, {
+                            examRegEdits: Math.max(
+                              0,
+                              permissions.examRegEdits - 1,
+                            ),
+                          });
+                          setExamEditMode(false);
+                          toast.success("Edit session ended. 1 credit used.");
+                        }}
+                      >
+                        <Save className="h-3 w-3" /> End Editing / Save All
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8 gap-1 text-xs"
+                        data-ocid="hod.exam_reg_errors.enable_editing_button"
+                        disabled={permissions.examRegEdits <= 0}
+                        title={
+                          permissions.examRegEdits <= 0
+                            ? "No edit credits. Ask Dean for more."
+                            : "Enable editing for all rows"
+                        }
+                        onClick={() => setExamEditMode(true)}
+                      >
+                        <PenLine className="h-3 w-3" /> Enable Editing
+                      </Button>
+                    )}
                   </div>
                 )}
               </div>
@@ -1053,10 +1281,11 @@ export default function HODDashboard() {
                         <TableHead>Student ID</TableHead>
                         <TableHead>Email</TableHead>
                         <TableHead>Course ID</TableHead>
+                        <TableHead>Course Name</TableHead>
                         <TableHead>Payment Status</TableHead>
                         <TableHead>Classification</TableHead>
                         <TableHead>Error Type</TableHead>
-                        <TableHead>Status</TableHead>
+                        <TableHead>Details</TableHead>
                         <TableHead>Action</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -1151,6 +1380,9 @@ export default function HODDashboard() {
                               <TableCell className="font-mono text-sm">
                                 {err.courseId}
                               </TableCell>
+                              <TableCell className="text-sm max-w-xs truncate">
+                                {err.courseName || "-"}
+                              </TableCell>
                               <TableCell>
                                 <Badge
                                   variant={
@@ -1188,22 +1420,34 @@ export default function HODDashboard() {
                                 </Badge>
                               </TableCell>
                               <TableCell>
-                                {err.edited ? (
-                                  <Badge className="bg-green-100 text-green-700 text-xs">
-                                    Edited
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="outline" className="text-xs">
-                                    Pending
-                                  </Badge>
-                                )}
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() =>
+                                    setViewErrorDialog({
+                                      type: "exam",
+                                      id: err.id,
+                                    })
+                                  }
+                                  className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
+                                  data-ocid={`hod.exam_reg_errors.view_button.${i + 1}`}
+                                >
+                                  <Eye className="h-3 w-3" /> View
+                                </Button>
                               </TableCell>
                               <TableCell>
                                 <Button
                                   size="sm"
                                   variant="outline"
-                                  onClick={() => startEditExam(err)}
-                                  disabled={permissions.examRegEdits <= 0}
+                                  onClick={() => {
+                                    setEditDialogExam(err.id);
+                                    setEditExamForm({
+                                      studentId: err.studentId,
+                                      courseId: err.courseId,
+                                      paymentStatus: err.paymentStatus,
+                                    });
+                                  }}
+                                  disabled={!examEditMode}
                                   className="h-7 px-2 gap-1"
                                   data-ocid={`hod.exam_reg_errors.edit_button.${i + 1}`}
                                 >
@@ -1396,6 +1640,512 @@ export default function HODDashboard() {
           })()}
         </motion.div>
       </main>
+      {/* View Error Details Dialog */}
+      {viewErrorDialog &&
+        (() => {
+          const isEnroll = viewErrorDialog.type === "enroll";
+          const err = isEnroll
+            ? branchEnrollErrors.find((e) => e.id === viewErrorDialog.id)
+            : branchExamErrors.find((e) => e.id === viewErrorDialog.id);
+          if (!err) return null;
+          return (
+            <Dialog open={true} onOpenChange={() => setViewErrorDialog(null)}>
+              <DialogContent
+                className="max-w-md"
+                data-ocid="hod.view_error.dialog"
+              >
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2 text-red-700">
+                    <Eye className="h-4 w-4" />
+                    Error Details
+                  </DialogTitle>
+                </DialogHeader>
+                <div className="space-y-3 text-sm">
+                  <div>
+                    <span className="font-semibold text-foreground">
+                      Course Name:{" "}
+                    </span>
+                    <span className="font-bold text-blue-700">
+                      {err.courseName || "-"}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="font-semibold text-foreground">
+                      Course ID:{" "}
+                    </span>
+                    <span className="font-mono">{err.courseId}</span>
+                  </div>
+                  <div>
+                    <span className="font-semibold text-foreground">
+                      Error Type:{" "}
+                    </span>
+                    <Badge variant="destructive" className="text-xs">
+                      {err.errorType}
+                    </Badge>
+                  </div>
+                  <div>
+                    <span className="font-semibold text-foreground">
+                      Description:{" "}
+                    </span>
+                    <span className="text-muted-foreground">{err.details}</span>
+                  </div>
+                  <div>
+                    <span className="font-semibold text-foreground">
+                      Student ID:{" "}
+                    </span>
+                    <span className="font-mono">{err.studentId}</span>
+                  </div>
+                  {err.email && (
+                    <div>
+                      <span className="font-semibold text-foreground">
+                        Email:{" "}
+                      </span>
+                      <span>{err.email}</span>
+                    </div>
+                  )}
+                </div>
+              </DialogContent>
+            </Dialog>
+          );
+        })()}
+
+      {/* Edit Enrollment Dialog */}
+      {editDialogEnroll &&
+        (() => {
+          const err = branchEnrollErrors.find((e) => e.id === editDialogEnroll);
+          if (!err) return null;
+          return (
+            <Dialog open={true} onOpenChange={() => setEditDialogEnroll(null)}>
+              <DialogContent
+                className="max-w-lg"
+                data-ocid="hod.edit_enroll.dialog"
+              >
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <PenLine className="h-4 w-4 text-indigo-600" />
+                    Edit Enrollment Record
+                  </DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4 text-sm">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <Label className="text-xs font-semibold">
+                        Student ID
+                      </Label>
+                      <Input
+                        value={editEnrollForm.studentId ?? ""}
+                        onChange={(e) =>
+                          setEditEnrollForm((p) => ({
+                            ...p,
+                            studentId: e.target.value,
+                          }))
+                        }
+                        className="h-8 text-sm mt-1"
+                        data-ocid="hod.enrollment_edit.studentid.input"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">Email</Label>
+                      <Input
+                        value={editEnrollForm.email ?? ""}
+                        onChange={(e) =>
+                          setEditEnrollForm((p) => ({
+                            ...p,
+                            email: e.target.value,
+                          }))
+                        }
+                        className="h-8 text-sm mt-1"
+                        data-ocid="hod.enrollment_edit.email.input"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">Course ID</Label>
+                      <Input
+                        value={editEnrollForm.courseId ?? ""}
+                        onChange={(e) =>
+                          setEditEnrollForm((p) => ({
+                            ...p,
+                            courseId: e.target.value,
+                          }))
+                        }
+                        className="h-8 text-sm mt-1"
+                        data-ocid="hod.enrollment_edit.courseid.input"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">
+                        Course Name
+                      </Label>
+                      <Input
+                        value={err.courseName || "-"}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <Label className="text-xs font-semibold">
+                        Error Type
+                      </Label>
+                      <Input
+                        value={err.errorType}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <Label className="text-xs font-semibold">
+                        Error Description
+                      </Label>
+                      <Input
+                        value={err.details}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setEditDialogEnroll(null)}
+                      data-ocid="hod.enrollment_edit.cancel_button.1"
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="default"
+                      onClick={() => {
+                        saveEditEnroll(editDialogEnroll);
+                        setEditDialogEnroll(null);
+                      }}
+                      data-ocid="hod.enrollment_edit.save_button.1"
+                    >
+                      <Save className="h-3 w-3 mr-1" /> Save
+                    </Button>
+                  </div>
+                </div>
+              </DialogContent>
+            </Dialog>
+          );
+        })()}
+
+      {/* Edit Exam Reg Dialog */}
+      {editDialogExam &&
+        (() => {
+          const err = branchExamErrors.find((e) => e.id === editDialogExam);
+          if (!err) return null;
+          return (
+            <Dialog open={true} onOpenChange={() => setEditDialogExam(null)}>
+              <DialogContent
+                className="max-w-lg"
+                data-ocid="hod.edit_exam.dialog"
+              >
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <PenLine className="h-4 w-4 text-indigo-600" />
+                    Edit Exam Registration Record
+                  </DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4 text-sm">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <Label className="text-xs font-semibold">
+                        Student ID
+                      </Label>
+                      <Input
+                        value={editExamForm.studentId ?? ""}
+                        onChange={(e) =>
+                          setEditExamForm((p) => ({
+                            ...p,
+                            studentId: e.target.value,
+                          }))
+                        }
+                        className="h-8 text-sm mt-1"
+                        data-ocid="hod.exam_edit.studentid.input"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">Email</Label>
+                      <Input
+                        value={err.email || "-"}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">Course ID</Label>
+                      <Input
+                        value={editExamForm.courseId ?? ""}
+                        onChange={(e) =>
+                          setEditExamForm((p) => ({
+                            ...p,
+                            courseId: e.target.value,
+                          }))
+                        }
+                        className="h-8 text-sm mt-1"
+                        data-ocid="hod.exam_edit.courseid.input"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">
+                        Course Name
+                      </Label>
+                      <Input
+                        value={err.courseName || "-"}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">
+                        Payment Status
+                      </Label>
+                      <Input
+                        value={editExamForm.paymentStatus ?? ""}
+                        onChange={(e) =>
+                          setEditExamForm((p) => ({
+                            ...p,
+                            paymentStatus: e.target.value,
+                          }))
+                        }
+                        className="h-8 text-sm mt-1"
+                        data-ocid="hod.exam_edit.payment.input"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs font-semibold">
+                        Classification
+                      </Label>
+                      <Input
+                        value={err.classification || "-"}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <Label className="text-xs font-semibold">
+                        Error Type
+                      </Label>
+                      <Input
+                        value={err.errorType}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <Label className="text-xs font-semibold">
+                        Error Description
+                      </Label>
+                      <Input
+                        value={err.details}
+                        disabled
+                        className="h-8 text-sm mt-1 bg-muted"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setEditDialogExam(null)}
+                      data-ocid="hod.exam_edit.cancel_button.1"
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="default"
+                      onClick={() => {
+                        saveEditExam(editDialogExam);
+                        setEditDialogExam(null);
+                      }}
+                      data-ocid="hod.exam_edit.save_button.1"
+                    >
+                      <Save className="h-3 w-3 mr-1" /> Save
+                    </Button>
+                  </div>
+                </div>
+              </DialogContent>
+            </Dialog>
+          );
+        })()}
+
+      {/* ── 12-Week Courses (visible to all HODs) ── */}
+      {(() => {
+        const twelveWeekCourses = uploadedCourses;
+        const totalCoursePages = Math.ceil(
+          twelveWeekCourses.length / COURSE_PAGE_SIZE,
+        );
+        const pagedCourses = twelveWeekCourses.slice(
+          (coursePage - 1) * COURSE_PAGE_SIZE,
+          coursePage * COURSE_PAGE_SIZE,
+        );
+        return (
+          <Card className="mt-6">
+            <CardHeader>
+              <CardTitle className="font-display text-base flex items-center gap-2">
+                <BookOpen className="h-4 w-4 text-primary" />
+                12-Week NPTEL Courses
+                {twelveWeekCourses.length > 0 && (
+                  <Badge variant="secondary">
+                    {twelveWeekCourses.length} courses
+                  </Badge>
+                )}
+              </CardTitle>
+              <CardDescription>
+                All 12-week courses uploaded by Dean — no branch filter applied
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {twelveWeekCourses.length === 0 ? (
+                <div
+                  data-ocid="hod.courses.empty_state"
+                  className="flex flex-col items-center gap-3 py-12 text-center text-muted-foreground"
+                >
+                  <BookOpen className="h-10 w-10 text-muted-foreground/40" />
+                  <p className="text-sm">
+                    No course data available. Dean has not uploaded the course
+                    file yet.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div
+                    className="rounded-lg border overflow-x-auto"
+                    data-ocid="hod.courses.table"
+                  >
+                    <Table>
+                      <TableHeader>
+                        <TableRow className="bg-muted/50">
+                          <TableHead className="w-10">#</TableHead>
+                          <TableHead>Course ID</TableHead>
+                          <TableHead>Course Name</TableHead>
+                          <TableHead>Duration</TableHead>
+                          <TableHead>Branch / Discipline</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {pagedCourses.map((course, i) => (
+                          <TableRow
+                            key={course.courseId}
+                            data-ocid={`hod.courses.row.${(coursePage - 1) * COURSE_PAGE_SIZE + i + 1}`}
+                          >
+                            <TableCell className="text-muted-foreground text-xs">
+                              {(coursePage - 1) * COURSE_PAGE_SIZE + i + 1}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs">
+                              {course.courseId}
+                            </TableCell>
+                            <TableCell className="font-medium text-sm">
+                              {course.courseName}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="outline" className="text-xs">
+                                {course.durationWeeks} weeks
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="secondary" className="text-xs">
+                                {course.branch}
+                              </Badge>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  {totalCoursePages > 1 && (
+                    <div className="flex items-center justify-between mt-4">
+                      <p className="text-xs text-muted-foreground">
+                        Showing {(coursePage - 1) * COURSE_PAGE_SIZE + 1}–
+                        {Math.min(
+                          coursePage * COURSE_PAGE_SIZE,
+                          twelveWeekCourses.length,
+                        )}{" "}
+                        of {twelveWeekCourses.length}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCoursePage((p) => Math.max(1, p - 1))
+                          }
+                          disabled={coursePage === 1}
+                          className="px-3 py-1 text-xs rounded border disabled:opacity-40"
+                          data-ocid="hod.courses.pagination_prev"
+                        >
+                          Previous
+                        </button>
+                        <span className="text-xs">
+                          Page {coursePage} / {totalCoursePages}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCoursePage((p) =>
+                              Math.min(totalCoursePages, p + 1),
+                            )
+                          }
+                          disabled={coursePage === totalCoursePages}
+                          className="px-3 py-1 text-xs rounded border disabled:opacity-40"
+                          data-ocid="hod.courses.pagination_next"
+                        >
+                          Next
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </CardContent>
+          </Card>
+        );
+      })()}
+
+      {/* Previous Files Banner for HOD */}
+      {selectedHodEnrollSnapshotIdx !== null && (
+        <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          Viewing historical enrollment data from{" "}
+          <strong>
+            {enrollmentFileSnapshots[selectedHodEnrollSnapshotIdx]?.fileName}
+          </strong>{" "}
+          uploaded on{" "}
+          {new Date(
+            enrollmentFileSnapshots[selectedHodEnrollSnapshotIdx]?.timestamp,
+          ).toLocaleString()}
+          . This is not the current active data.
+          <button
+            type="button"
+            onClick={() => setSelectedHodEnrollSnapshotIdx(null)}
+            className="ml-auto underline text-amber-700"
+          >
+            View Latest
+          </button>
+        </div>
+      )}
+      {selectedHodExamRegSnapshotIdx !== null && (
+        <div className="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 flex items-center gap-2">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          Viewing historical exam reg data from{" "}
+          <strong>
+            {examRegFileSnapshots[selectedHodExamRegSnapshotIdx]?.fileName}
+          </strong>{" "}
+          uploaded on{" "}
+          {new Date(
+            examRegFileSnapshots[selectedHodExamRegSnapshotIdx]?.timestamp,
+          ).toLocaleString()}
+          . This is not the current active data.
+          <button
+            type="button"
+            onClick={() => setSelectedHodExamRegSnapshotIdx(null)}
+            className="ml-auto underline text-amber-700"
+          >
+            View Latest
+          </button>
+        </div>
+      )}
     </div>
   );
 }

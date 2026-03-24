@@ -60,10 +60,10 @@ export const DEAN_CREDENTIALS = {
 export function getStudentEmailPattern(college: string): RegExp {
   const c = college.toLowerCase();
   if (c.includes("nuzvid")) return /^n\d{6}@rguktn\.ac\.in$/i;
-  if (c.includes("srikakulam")) return /^s\d{6}@rguktsklm\.ac\.in$/i;
+  if (c.includes("srikakulam")) return /^(rs?|s)\d{6}@rguktsklm\.ac\.in$/i;
   if (c.includes("rk valley") || c.includes("rkvalley"))
-    return /^r\d{6}@rguktrkv\.ac\.in$/i;
-  if (c.includes("ongole")) return /^o\d{6}@rguktong\.ac\.in$/i;
+    return /^rr?\d{6}@rguktrkv\.ac\.in$/i;
+  if (c.includes("ongole")) return /^(ro?|o)\d{6}@rguktong\.ac\.in$/i;
   return /^[a-z]\d{6}@rguktn\.ac\.in$/i; // fallback
 }
 
@@ -81,10 +81,12 @@ export function getStudentIdPrefix(college: string): string {
 export function getStudentEmailExample(college: string): string {
   const c = college.toLowerCase();
   if (c.includes("nuzvid")) return "n200623@rguktn.ac.in";
-  if (c.includes("srikakulam")) return "s120042@rguktsklm.ac.in";
+  if (c.includes("srikakulam"))
+    return "s210038@rguktsklm.ac.in / rs210038@rguktsklm.ac.in";
   if (c.includes("rk valley") || c.includes("rkvalley"))
-    return "r210123@rguktrkv.ac.in";
-  if (c.includes("ongole")) return "o230234@rguktong.ac.in";
+    return "r210038@rguktrkv.ac.in / rr210038@rguktrkv.ac.in";
+  if (c.includes("ongole"))
+    return "o210038@rguktong.ac.in / ro210038@rguktong.ac.in";
   return "n200623@rguktn.ac.in";
 }
 
@@ -134,6 +136,7 @@ export interface ExamShuffleUploadRecord {
   examSlot?: string;
   hallTicketNo?: string;
   venue?: string;
+  seatingNumber?: string;
 }
 
 // ─── Student Record Interfaces (kept for type usage) ─────────────────────────
@@ -222,6 +225,7 @@ export interface EnrollmentError {
   courseId: string;
   errorType: string;
   details: string;
+  courseName?: string;
   branch: Branch;
   edited?: boolean;
 }
@@ -237,6 +241,7 @@ export interface ExamRegError {
   classification: string;
   errorType: string;
   details?: string;
+  courseName?: string;
   branch: Branch;
   edited?: boolean;
 }
