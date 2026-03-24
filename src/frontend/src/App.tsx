@@ -11,9 +11,10 @@ import { AppProvider } from "./context/AppContext";
 import CollegeSelectPage from "./pages/CollegeSelectPage";
 import DeanDashboard from "./pages/DeanDashboard";
 import HODDashboard from "./pages/HODDashboard";
-import HomePage from "./pages/HomePage";
 import LoginPage from "./pages/LoginPage";
+import PortalPage from "./pages/PortalPage";
 import StudentDashboard from "./pages/StudentDashboard";
+import YearSelectPage from "./pages/YearSelectPage";
 
 // ── Root route ────────────────────────────────────────────────────────────────
 const rootRoute = createRootRoute({
@@ -25,11 +26,18 @@ const rootRoute = createRootRoute({
   ),
 });
 
-// ── Home ──────────────────────────────────────────────────────────────────────
+// ── Year select (new homepage) ────────────────────────────────────────────────
 const homeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
-  component: HomePage,
+  component: YearSelectPage,
+});
+
+// ── Portal (college selection) ────────────────────────────────────────────────
+const portalRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/portal",
+  component: PortalPage,
 });
 
 // ── College select ────────────────────────────────────────────────────────────
@@ -80,6 +88,7 @@ const catchAllRoute = createRoute({
 // ── Router ────────────────────────────────────────────────────────────────────
 const routeTree = rootRoute.addChildren([
   homeRoute,
+  portalRoute,
   collegeRoute,
   loginRoute,
   studentRoute,

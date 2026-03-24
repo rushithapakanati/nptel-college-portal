@@ -75,6 +75,9 @@ interface AppContextValue {
   currentUser: CurrentUser | null;
   setCurrentUser: (user: CurrentUser | null) => void;
 
+  selectedAcademicYear: string;
+  setSelectedAcademicYear: (year: string) => void;
+
   hodPermissions: HodPermissions;
   updateHodPermission: (
     branch: Branch,
@@ -128,13 +131,15 @@ const AppContext = createContext<AppContextValue | null>(null);
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [selectedAcademicYear, setSelectedAcademicYear] = useState<string>("");
 
   const [campusDataMap, setCampusDataMap] = useState<
     Record<string, CampusData>
   >({});
 
   function campusKey(college?: string): string {
-    return (college ?? currentUser?.college ?? "").toLowerCase().trim();
+    const campus = (college ?? currentUser?.college ?? "").toLowerCase().trim();
+    return selectedAcademicYear ? `${selectedAcademicYear}_${campus}` : campus;
   }
 
   function getCampusData(college?: string): CampusData {
@@ -292,6 +297,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       value={{
         currentUser,
         setCurrentUser,
+
+        selectedAcademicYear,
+        setSelectedAcademicYear,
 
         hodPermissions: campus.hodPermissions,
         updateHodPermission,
