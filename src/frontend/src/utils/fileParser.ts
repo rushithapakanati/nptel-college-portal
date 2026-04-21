@@ -1,12 +1,6 @@
 /**
- * Real file parser for CSV and Excel files.
- * Uses native browser APIs for CSV parsing (handles 100k+ rows).
- * Uses a bundled minimal XLSX parser for Excel files.
- *
- * All validation is applied strictly to the actual file data.
- * No hardcoded/sample records are used.
- *
- * Designed to handle NPTEL export formats with flexible column name matching.
+ * File parser for CSV and Excel files (browser-native + SheetJS).
+ * Handles 100,000+ rows; all validation is applied to real uploaded data only.
  */
 
 import type {
@@ -17,121 +11,169 @@ import type {
   ExamShuffleUploadRecord,
   StudentUploadRecord,
 } from "../data/mockData";
-import {
-  BRANCHES,
-  getStudentEmailDomain,
-  getStudentEmailPattern,
-  getStudentIdPrefix,
-} from "../data/mockData";
+import { BRANCHES, isValidStudentEmail } from "../data/mockData";
 
-// ─── Column name normalizer ────────────────────────────────────────────────────
-// Normalizes header names for flexible matching regardless of case/spacing/special chars
-function norm(s: string): string {
-  return s
+// ─── Column normalizer ────────────────────────────────────────────────────────
+
+const _normCache = new Map<string, string>();
+
+export function normCol(s: string): string {
+  const cached = _normCache.get(s);
+  if (cached !== undefined) return cached;
+  const result = s
     .trim()
     .toLowerCase()
     .replace(/[\s_\-\/\(\)\.]+/g, "");
+  _normCache.set(s, result);
+  return result;
 }
 
-// Find a column value from a row using multiple possible column names
-// Priority: exact match > row-key-contains-search-key > search-key-contains-row-key (only if search key is long enough)
-function col(row: Record<string, string>, ...keys: string[]): string {
-  const rowKeys = Object.keys(row);
+// Column variant lists
+export const ROLL_NO_COLS = [
+  "rollno",
+  "studentid",
+  "enrollmentid",
+  "idno",
+  "studentrollno",
+  "regno",
+  "registrationno",
+  "rollnumber",
+];
+export const NAME_COLS = ["name", "studentname", "fullname", "candidatename"];
+export const EMAIL_COLS = [
+  "email",
+  "mailid",
+  "collegemail",
+  "personalmail",
+  "collegeemailpersonalemail",
+  "emailid",
+  "collegeemail",
+  "emailaddress",
+  "instituteemail",
+];
+export const COURSE_ID_COLS = [
+  "courseid",
+  "course_id",
+  "nptelcourseid",
+  "courseidentifier",
+  "examcourseid",
+];
+export const COURSE_NAME_COLS = [
+  "coursename",
+  "course",
+  "nptelcourse",
+  "coursetitle",
+  "subject",
+  "nptelcoursename",
+];
+export const DURATION_COLS = [
+  "duration",
+  "weeks",
+  "courseduration",
+  "durationweeks",
+  "noofweeks",
+  "numberofweeks",
+  "durationinweeks",
+];
+export const PAYMENT_STATUS_COLS = [
+  "paymentstatus",
+  "payment",
+  "status",
+  "registrationstatus",
+  "paymentstate",
+  "transactionstatus",
+];
+export const ENROLLMENT_STATUS_COLS = [
+  "enrollmentstatus",
+  "enrolled",
+  "status",
+  "enrollstatus",
+];
+export const SEATING_COLS = [
+  "seatingnumber",
+  "seatingposition",
+  "seatingno",
+  "seatno",
+  "seatnumber",
+  "seat",
+];
+export const EXAM_CENTER_COLS = [
+  "examcenter",
+  "center",
+  "venue",
+  "examinationcenter",
+  "examvenue",
+  "city",
+];
+export const EXAM_DATE_COLS = [
+  "examdate",
+  "date",
+  "examinationdate",
+  "testdate",
+];
+export const TIME_SLOT_COLS = [
+  "timeslot",
+  "slot",
+  "time",
+  "examtime",
+  "examslot",
+  "session",
+];
+export const HALL_TICKET_COLS = [
+  "hallticketno",
+  "hallticket",
+  "ticketno",
+  "admitcard",
+  "admitcardno",
+];
 
-  // 1. Exact match first (after normalization)
-  for (const k of keys) {
-    for (const rowKey of rowKeys) {
-      if (norm(rowKey) === norm(k)) {
-        return (row[rowKey] ?? "").trim();
+/** Find a column header among a row by checking normalized variant names */
+export function findCol(
+  headers: string[],
+  variants: string[],
+): string | undefined {
+  const normVariants = variants.map(normCol);
+  // 1. Exact normalized match
+  for (const h of headers) {
+    const nh = normCol(h);
+    if (normVariants.includes(nh)) return h;
+  }
+  // 2. Header contains variant as substring (min 4 chars)
+  for (const variant of normVariants) {
+    if (variant.length < 4) continue;
+    for (const h of headers) {
+      if (normCol(h).includes(variant)) return h;
+    }
+  }
+  // 3. Variant contains header as substring (header >= 5 chars)
+  for (const h of headers) {
+    const nh = normCol(h);
+    if (nh.length >= 5) {
+      for (const variant of normVariants) {
+        if (variant.includes(nh)) return h;
       }
     }
   }
-
-  // 2. Row key contains the search key as substring (e.g. "Student Roll No" contains "rollno")
-  for (const k of keys) {
-    const normK = norm(k);
-    // Only use substring match if the search key is at least 4 chars to avoid false positives
-    if (normK.length < 4) continue;
-    for (const rowKey of rowKeys) {
-      const normRowKey = norm(rowKey);
-      if (normRowKey.includes(normK)) {
-        const val = (row[rowKey] ?? "").trim();
-        if (val) return val;
-      }
-    }
-  }
-
-  // 3. Search key contains the row key (only if row key is reasonably long: >= 5 chars)
-  for (const k of keys) {
-    const normK = norm(k);
-    for (const rowKey of rowKeys) {
-      const normRowKey = norm(rowKey);
-      if (normRowKey.length >= 5 && normK.includes(normRowKey)) {
-        const val = (row[rowKey] ?? "").trim();
-        if (val) return val;
-      }
-    }
-  }
-
-  return "";
+  return undefined;
 }
 
-// Exact-only column lookup (no substring fallback) - used when substring matching causes false positives
-function colExact(row: Record<string, string>, ...keys: string[]): string {
-  const rowKeys = Object.keys(row);
-  for (const k of keys) {
-    for (const rowKey of rowKeys) {
-      if (norm(rowKey) === norm(k)) {
-        return (row[rowKey] ?? "").trim();
-      }
-    }
-  }
-  return "";
+/** Extract a value from a row using variant column names */
+function getVal(row: Record<string, string>, variants: string[]): string {
+  const headers = Object.keys(row);
+  const matched = findCol(headers, variants);
+  return matched ? (row[matched] ?? "").trim() : "";
 }
 
-/** Returns all header names from a row (for debugging) */
-export function getFileHeaders(rows: Record<string, string>[]): string[] {
-  if (rows.length === 0) return [];
-  return Object.keys(rows[0]);
-}
+// ─── CSV Parser ───────────────────────────────────────────────────────────────
 
-// ─── CSV Parser (native, handles 100k+ rows) ─────────────────────────────────
-export function parseCSVFile(file: File): Promise<Record<string, string>[]> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const text = e.target!.result as string;
-        const rows = parseCSVText(text);
-        resolve(rows);
-      } catch (err) {
-        reject(err);
-      }
-    };
-    reader.onerror = () => reject(new Error("Failed to read file"));
-    reader.readAsText(file, "utf-8");
-  });
-}
-
-/**
- * Native CSV text parser.
- * Handles quoted fields, commas inside quotes, newlines inside quotes.
- * Returns array of row objects keyed by header row values.
- */
-function parseCSVText(text: string): Record<string, string>[] {
-  // Normalize line endings
+export function parseCSVText(text: string): Record<string, string>[] {
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = splitCSVLines(normalized);
-
+  const lines = splitLines(normalized);
   if (lines.length === 0) return [];
-
-  // Find the header row (first non-empty line)
-  let headerIdx = 0;
-  const headers = parseCSVLine(lines[headerIdx]);
+  const headers = parseCSVLine(lines[0]);
   if (headers.length === 0) return [];
-
   const rows: Record<string, string>[] = [];
-  for (let i = headerIdx + 1; i < lines.length; i++) {
+  for (let i = 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     const vals = parseCSVLine(lines[i]);
     const row: Record<string, string> = {};
@@ -148,55 +190,45 @@ function parseCSVText(text: string): Record<string, string>[] {
   return rows;
 }
 
-function splitCSVLines(text: string): string[] {
+function splitLines(text: string): string[] {
   const lines: string[] = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
+  let cur = "";
+  let inQ = false;
+  for (const ch of text) {
     if (ch === '"') {
-      inQuotes = !inQuotes;
-      current += ch;
-    } else if (ch === "\n" && !inQuotes) {
-      lines.push(current);
-      current = "";
-    } else {
-      current += ch;
-    }
+      inQ = !inQ;
+      cur += ch;
+    } else if (ch === "\n" && !inQ) {
+      lines.push(cur);
+      cur = "";
+    } else cur += ch;
   }
-  if (current) lines.push(current);
+  if (cur) lines.push(cur);
   return lines;
 }
 
 function parseCSVLine(line: string): string[] {
   const fields: string[] = [];
   let field = "";
-  let inQuotes = false;
+  let inQ = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        // Escaped quote
+      if (inQ && line[i + 1] === '"') {
         field += '"';
         i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (ch === "," && !inQuotes) {
+      } else inQ = !inQ;
+    } else if (ch === "," && !inQ) {
       fields.push(field.trim());
       field = "";
-    } else {
-      field += ch;
-    }
+    } else field += ch;
   }
   fields.push(field.trim());
   return fields;
 }
 
-// ─── Known NPTEL column keywords used to detect the real header row ───────────
-// A row is a header row if it has 4+ keyword matches AND contains at least one "anchor" keyword
-// (course, discipline, roll, student, email, enrollment) -- this prevents metadata rows from
-// being misidentified as headers just because they contain words like "week" or "institute".
+// ─── Header row detection ─────────────────────────────────────────────────────
+
 const HEADER_KEYWORDS = [
   "name",
   "email",
@@ -213,22 +245,14 @@ const HEADER_KEYWORDS = [
   "discipline",
   "program",
   "stream",
-  "profession",
-  "category",
   "nptel",
   "registration",
   "college",
   "institute",
-  "sme",
 ];
-
-// Anchor keywords: at least one cell must exactly or closely match one of these
-// to confirm the row is a real header (not metadata like dates/sessions)
-const HEADER_ANCHOR_KEYWORDS = [
+const ANCHOR_KEYWORDS = [
   "course id",
   "courseid",
-  "course_id",
-  "discipline",
   "roll no",
   "rollno",
   "student id",
@@ -237,29 +261,22 @@ const HEADER_ANCHOR_KEYWORDS = [
   "enrollment",
   "course name",
   "coursename",
-  "sme name",
 ];
 
-function rowLooksLikeHeader(rowValues: string[]): boolean {
-  // Count how many cells match a known header keyword
+function rowLooksLikeHeader(vals: string[]): boolean {
   let matches = 0;
   let hasAnchor = false;
-
-  for (const val of rowValues) {
+  for (const val of vals) {
     const v = val.toLowerCase().trim();
     if (!v || v.startsWith("__empty")) continue;
-
-    // Check anchor keywords (exact/close match on cell value)
     if (!hasAnchor) {
-      for (const anchor of HEADER_ANCHOR_KEYWORDS) {
-        if (v === anchor || v.includes(anchor)) {
+      for (const a of ANCHOR_KEYWORDS) {
+        if (v === a || v.includes(a)) {
           hasAnchor = true;
           break;
         }
       }
     }
-
-    // Check general header keywords
     for (const kw of HEADER_KEYWORDS) {
       if (v.includes(kw)) {
         matches++;
@@ -267,168 +284,137 @@ function rowLooksLikeHeader(rowValues: string[]): boolean {
       }
     }
   }
-
-  // Must have at least 4 keyword matches AND at least 1 anchor keyword
-  return matches >= 4 && hasAnchor;
+  return matches >= 3 && hasAnchor;
 }
 
-// ─── Excel Parser ──────────────────────────────────────────────────────────────
-// Uses XLSX library loaded from CDN (SheetJS) via dynamic script injection.
-// Falls back to CSV parsing if CDN load fails.
+// ─── Excel Parser (SheetJS via CDN) ───────────────────────────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type XLSXLib = any;
+let _xlsxCache: XLSXLib | null = null;
 
-let xlsxLibCache: XLSXLib | null = null;
-
-export async function loadXLSXLib(): Promise<XLSXLib> {
-  if (xlsxLibCache) return xlsxLibCache;
-  // Check if already loaded globally
+export async function loadXLSX(): Promise<XLSXLib> {
+  if (_xlsxCache) return _xlsxCache;
   if (
     typeof window !== "undefined" &&
     (window as Window & { XLSX?: XLSXLib }).XLSX
   ) {
-    xlsxLibCache = (window as Window & { XLSX?: XLSXLib }).XLSX;
-    return xlsxLibCache;
+    _xlsxCache = (window as Window & { XLSX?: XLSXLib }).XLSX;
+    return _xlsxCache;
   }
-  // Dynamically inject SheetJS from CDN
   return new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src =
-      "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js";
-    script.onload = () => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js";
+    s.onload = () => {
       const lib = (window as Window & { XLSX?: XLSXLib }).XLSX;
       if (lib) {
-        xlsxLibCache = lib;
+        _xlsxCache = lib;
         resolve(lib);
-      } else {
-        reject(new Error("XLSX library failed to load"));
-      }
+      } else reject(new Error("XLSX library not found after script load"));
     };
-    script.onerror = () =>
-      reject(new Error("Failed to load XLSX library from CDN"));
-    document.head.appendChild(script);
+    s.onerror = () => reject(new Error("Failed to load XLSX from CDN"));
+    document.head.appendChild(s);
   });
 }
 
-export async function parseExcelFile(
-  file: File,
-): Promise<Record<string, string>[]> {
-  let XLSX: XLSXLib;
-  try {
-    XLSX = await loadXLSXLib();
-  } catch {
-    // CDN failed — try reading as CSV (some .xls are actually CSV-like)
-    return parseCSVFile(file);
+export function parseExcelBuffer(
+  buffer: ArrayBuffer,
+): Record<string, string>[] {
+  const XLSX = _xlsxCache;
+  if (!XLSX)
+    throw new Error(
+      "XLSX library not loaded — call parseFile() which loads it async",
+    );
+  const workbook = XLSX.read(new Uint8Array(buffer), { type: "array" });
+  const sheetName = workbook.SheetNames[0];
+  const ws = workbook.Sheets[sheetName];
+  const rawArrays = XLSX.utils.sheet_to_json(ws, {
+    header: 1,
+    defval: "",
+    raw: false,
+  }) as string[][];
+
+  // Find header row (scan first 20)
+  let headerRowIndex = 0;
+  for (let i = 0; i < Math.min(20, rawArrays.length); i++) {
+    const vals = rawArrays[i].map((v: unknown) => String(v ?? "").trim());
+    if (rowLooksLikeHeader(vals)) {
+      headerRowIndex = i;
+      break;
+    }
   }
 
+  const json = XLSX.utils.sheet_to_json(ws, {
+    defval: "",
+    raw: false,
+    range: headerRowIndex,
+  }) as Record<string, unknown>[];
+  return json
+    .map((row) => {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(row)) {
+        if (String(k).startsWith("__EMPTY")) continue;
+        out[k] = String(v ?? "").trim();
+      }
+      return out;
+    })
+    .filter((r) => Object.values(r).some((v) => v.length > 0));
+}
+
+/** Auto-detect CSV or Excel and parse. Async — loads XLSX lib if needed. */
+export async function parseFile(file: File): Promise<Record<string, string>[]> {
+  const ext = file.name.split(".").pop()?.toLowerCase();
+  if (ext === "csv") {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          resolve(parseCSVText(e.target!.result as string));
+        } catch (err) {
+          reject(err);
+        }
+      };
+      reader.onerror = () => reject(new Error("Failed to read CSV"));
+      reader.readAsText(file, "utf-8");
+    });
+  }
+  // Excel
+  const XLSX = await loadXLSX();
+  _xlsxCache = XLSX;
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const data = new Uint8Array(e.target!.result as ArrayBuffer);
-        const workbook = XLSX.read(data, { type: "array" });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-
-        // First attempt: parse raw as array-of-arrays to find the real header row
-        const rawArrays = XLSX.utils.sheet_to_json(worksheet, {
-          header: 1,
-          defval: "",
-          raw: false,
-        }) as string[][];
-
-        // Find the first row that looks like a real header (scan up to first 20 rows)
-        let headerRowIndex = 0;
-        for (let i = 0; i < Math.min(20, rawArrays.length); i++) {
-          const rowVals = rawArrays[i].map((v: unknown) =>
-            String(v ?? "").trim(),
-          );
-          if (rowLooksLikeHeader(rowVals)) {
-            headerRowIndex = i;
-            break;
-          }
-        }
-
-        // Re-parse with the detected header row
-        const json = XLSX.utils.sheet_to_json(worksheet, {
-          defval: "",
-          raw: false,
-          range: headerRowIndex,
-        }) as Record<string, unknown>[];
-
-        const rows = json.map((row) => {
-          const normalized: Record<string, string> = {};
-          for (const [k, v] of Object.entries(row)) {
-            // Skip __EMPTY columns (from merged cells)
-            if (String(k).startsWith("__EMPTY")) continue;
-            normalized[k] = String(v ?? "").trim();
-          }
-          return normalized;
-        });
-
-        // Filter out rows that are effectively empty after removing __EMPTY cols
-        const nonEmptyRows = rows.filter((r) => {
-          const vals = Object.values(r) as string[];
-          return vals.some((v) => v.length > 0);
-        });
-
-        resolve(nonEmptyRows);
+        resolve(parseExcelBuffer(e.target!.result as ArrayBuffer));
       } catch (err) {
         reject(err);
       }
     };
-    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.onerror = () => reject(new Error("Failed to read Excel file"));
     reader.readAsArrayBuffer(file);
   });
 }
 
-// ─── Dispatcher ───────────────────────────────────────────────────────────────
-export async function parseUploadedFile(
-  file: File,
-): Promise<Record<string, string>[]> {
-  const ext = file.name.split(".").pop()?.toLowerCase();
-  if (ext === "csv") {
-    return parseCSVFile(file);
-  }
-  if (ext === "xlsx" || ext === "xls") {
-    return parseExcelFile(file);
-  }
-  // Try CSV as fallback
-  return parseCSVFile(file);
-}
+// ─── Branch detection ─────────────────────────────────────────────────────────
 
-// ─── Detect branch from row ────────────────────────────────────────────────────
-function detectBranch(row: Record<string, string>): Branch | null {
-  // Try multiple possible column names for department/branch
-  const dept = col(
-    row,
-    "Department",
-    "Branch",
-    "Dept",
+function detectBranch(row: Record<string, string>): Branch {
+  const dept = getVal(row, [
     "department",
     "branch",
-    "Discipline",
+    "dept",
     "discipline",
-    "Program",
+    "program",
     "programme",
-    "Stream",
     "stream",
-    "Course Branch",
     "coursebranch",
-  ).toUpperCase();
-
-  if (!dept) return null;
-
+  ]).toUpperCase();
+  if (!dept) return "CSE";
   for (const b of BRANCHES) {
     if (dept === b) return b;
   }
-
-  // Substring / partial match
   if (
     dept.includes("COMPUTER") ||
     dept.includes("CSE") ||
-    dept.includes("IT") ||
     dept.includes("INFORMATION")
   )
     return "CSE";
@@ -440,465 +426,168 @@ function detectBranch(row: Record<string, string>): Branch | null {
     return "ECE";
   if (dept.includes("ELECTRICAL") || dept.includes("EEE")) return "EEE";
   if (
-    dept.includes("MECHANICAL") ||
-    dept.includes("MECH") ||
-    (dept.includes("ME") && !dept.includes("MME") && !dept.includes("MET"))
-  )
-    return "ME";
-  if (
     dept.includes("METALLURG") ||
     dept.includes("MME") ||
     dept.includes("MATERIAL")
   )
     return "MME";
-  if (dept.includes("CHEM") || dept.includes("CH")) return "CHEM";
+  if (
+    dept.includes("MECHANICAL") ||
+    (dept.includes("ME") && !dept.includes("MME"))
+  )
+    return "ME";
+  if (dept.includes("CHEM") || (dept.includes("CH") && !dept.includes("ECE")))
+    return "CHEM";
   if (dept.includes("CIVIL") || (dept.includes("CE") && !dept.includes("ECE")))
     return "CE";
-
-  return null;
+  return "CSE";
 }
 
-/**
- * Try to parse duration as a number from string.
- * Handles values like "12", "12 weeks", "12 Weeks", "12-week", "12week"
- */
-function parseDuration(raw: string): number | null {
-  if (!raw) return null;
-  const cleaned = raw
-    .trim()
-    .toLowerCase()
-    .replace(/weeks?/g, "")
-    .replace(/-/g, "")
-    .trim();
-  const n = Number.parseInt(cleaned, 10);
-  return Number.isNaN(n) ? null : n;
-}
+// ─── Validation Regexes ───────────────────────────────────────────────────────
 
-// ─── Parse Course File ─────────────────────────────────────────────────────────
-/**
- * Parses a course file and returns all 12-week courses.
- * NPTEL course files may have many different column name formats.
- * Supports: Course ID, Course Name, Duration (weeks), Branch/Department
- */
-export function parseCourseRows(rows: Record<string, string>[]): Course[] {
-  const courses: Course[] = [];
+const COURSE_ID_REGEX = /^[a-zA-Z0-9]{6,15}$/;
+const PERSONAL_EMAIL_REGEX =
+  /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
 
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
+// ─── Enrollment Validator ─────────────────────────────────────────────────────
 
-    // ── Course ID ──
-    const courseId = col(
-      row,
-      "Course ID",
-      "CourseID",
-      "course_id",
-      "courseid",
-      "COURSE ID",
-      "Course Id",
-      "course id",
-      "nptel course id",
-      "nptelcourseid",
-    );
-
-    // ── Course Name ──
-    const courseName = col(
-      row,
-      "Course Name",
-      "CourseName",
-      "course_name",
-      "name",
-      "Title",
-      "COURSE NAME",
-      "Course Title",
-      "coursetitle",
-      "Subject",
-      "subject",
-      "NPTEL Course Name",
-      "nptelcoursename",
-    );
-
-    // ── Duration ──
-    // The course file has a column literally named "duration" (beside institute column).
-    // Try exact matches first, then broader variations.
-    const durationRaw = colExact(
-      row,
-      "duration",
-      "Duration",
-      "DURATION",
-      "Weeks",
-      "weeks",
-      "WEEKS",
-      "Duration (Weeks)",
-      "Course Duration",
-      "Weeks Duration",
-      "durationweeks",
-      "courseduration",
-      "Duration in Weeks",
-      "No. of Weeks",
-      "Number of Weeks",
-      "noofweeks",
-      "numberofweeks",
-      "Week",
-      "week",
-    );
-
-    const branch = detectBranch(row);
-
-    // Parse duration
-    const durationWeeks = parseDuration(durationRaw);
-
-    // Only include 12-week courses.
-    // If duration column is present and value is NOT 12, skip the row.
-    // If duration value is unparseable but non-empty string exists, still try to skip non-12.
-    if (durationWeeks !== null && durationWeeks !== 12) continue;
-    // If durationRaw is non-empty but couldn't be parsed as number, treat cautiously:
-    // check if it contains "12" to be safe
-    if (durationWeeks === null && durationRaw && !durationRaw.includes("12"))
-      continue;
-    if (!courseId && !courseName) continue;
-
-    courses.push({
-      courseId: (courseId || `course-${i}`).trim(),
-      courseName: courseName || courseId || `Course ${i + 1}`,
-      durationWeeks: 12,
-      branch: branch ?? "CSE",
-    });
-  }
-  return courses;
-}
-
-// ─── Parse & Validate Enrollment Rows ─────────────────────────────────────────
-/**
- * Validates enrollment data rows from an uploaded file.
- * Checks:
- * 1. Email format matches campus pattern
- * 2. Student ID starts with campus prefix letter
- * 3. Course ID year matches current year (noc26-xxx in 2026)
- * 4. If course file uploaded, checks course ID exists in it
- */
-export function validateEnrollmentRows(
+export function validateEnrollmentErrors(
   rows: Record<string, string>[],
-  collegeName: string,
-  uploadedCourseIds: string[], // from uploaded course file; empty means skip course-file check
-  uploadedCourses: Course[] = [], // full course objects for 12-week duration check
+  campus: string,
+  branch: string,
+  source: "dean" | "hod",
+  twelveWeekCourses: Course[],
 ): { records: StudentUploadRecord[]; errors: EnrollmentError[] } {
-  const emailPattern = getStudentEmailPattern(collegeName);
-  const idPrefix = getStudentIdPrefix(collegeName);
-  const currentYear = new Date().getFullYear().toString().slice(-2); // "26" for 2026
-
   const records: StudentUploadRecord[] = [];
   const errors: EnrollmentError[] = [];
+  const courseIdSet = new Set(
+    twelveWeekCourses.map((c) => c.courseId.toLowerCase().trim()),
+  );
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
 
-    // ── Extract fields with broad column name matching ──
+    const studentId = getVal(row, ROLL_NO_COLS);
+    const email = getVal(row, EMAIL_COLS);
+    const courseId = getVal(row, COURSE_ID_COLS);
+    const courseName = getVal(row, COURSE_NAME_COLS) || courseId;
+    const name = getVal(row, NAME_COLS);
+    const duration = getVal(row, DURATION_COLS);
+    const enrollmentStatus = getVal(row, ENROLLMENT_STATUS_COLS);
+    const paymentStatus = getVal(row, PAYMENT_STATUS_COLS);
 
-    const studentId = col(
-      row,
-      "Student ID",
-      "StudentID",
-      "student_id",
-      "EnrollmentID",
-      "Enrollment ID",
-      "Roll No",
-      "Roll Number",
-      "Roll no",
-      "RollNo",
-      "rollno",
-      "rollnumber",
-      "STUDENT ID",
-      "Reg No",
-      "regno",
-      "Registration No",
-      "Stud ID",
-      "studid",
-      "Student Roll No",
-      "StudentRollNo",
-    );
-
-    const email = col(
-      row,
-      "Email",
-      "Email ID",
-      "EmailID",
-      "email",
-      "email_id",
-      "Email Address",
-      "emailaddress",
-      "EMAIL",
-      "Email Id",
-      "emailid",
-      "College Email",
-      "collegeemail",
-      "Institute Email",
-      "instituteemail",
-      "College Email/Personal Email",
-      "Personal Email",
-      "personal_email",
-      "College/Personal Email",
-      "college_personal_email",
-    );
-
-    const courseId = col(
-      row,
-      "Course ID",
-      "CourseID",
-      "course_id",
-      "COURSE ID",
-      "Course Id",
-      "courseid",
-      "nptel course id",
-      "nptelcourseid",
-      "Enrollment Course ID",
-      "enrollmentcourseid",
-    );
-
-    const profession = col(
-      row,
-      "Profession",
-      "Role",
+    const profession = getVal(row, [
       "profession",
       "role",
-      "Type",
-      "Occupation",
-      "occupation",
-      "User Type",
+      "type",
       "usertype",
-      "Category",
       "category",
-    );
-
-    const durationStr = colExact(
-      row,
-      "duration",
-      "Duration",
-      "DURATION",
-      "Weeks",
-      "Course Duration",
-      "Duration (Weeks)",
-      "durationweeks",
-      "courseduration",
-      "Duration in Weeks",
-      "No. of Weeks",
-    );
-
-    const courseName = col(
-      row,
-      "Course Name",
-      "CourseName",
-      "course_name",
-      "Course Title",
-      "coursetitle",
-      "Subject",
-    );
-
-    const enrollmentStatus = col(
-      row,
-      "Enrollment Status",
-      "Status",
-      "enrollment_status",
-      "enrollmentstatus",
-      "Enroll Status",
-      "enrollstatus",
-    );
-
-    const name = col(
-      row,
-      "Name",
-      "Student Name",
-      "studentname",
-      "Full Name",
-      "fullname",
-      "Candidate Name",
-      "candidatename",
-    );
-
-    // Skip completely empty rows
+      "occupation",
+    ]);
+    if (profession.toLowerCase().includes("faculty")) continue;
     if (!studentId && !email && !courseId) continue;
 
-    // Skip faculty rows
-    if (profession?.toLowerCase().includes("faculty")) continue;
-
-    const branch = detectBranch(row) ?? "CSE";
-    const durationWeeks = parseDuration(durationStr) ?? undefined;
+    const detectedBranch = (branch as Branch) || detectBranch(row);
 
     const record: StudentUploadRecord = {
       studentId,
-      email,
       name: name || undefined,
+      email,
       courseId,
-      branch,
       courseName: courseName || undefined,
-      durationWeeks,
+      duration: duration || undefined,
       enrollmentStatus: enrollmentStatus || undefined,
-      profession: profession || "Student",
+      paymentStatus: paymentStatus || undefined,
+      branch: detectedBranch as Branch,
+      source,
+      hodBranch: source === "hod" ? branch : undefined,
     };
     records.push(record);
 
-    // ── Validation checks (all checks run independently per row, multiple errors possible) ──
+    const rowCourseId = courseId;
+    const rowCourseName = courseName || courseId || "Unknown Course";
 
-    // Helper: extract the prefix letter from student ID (first character)
-    const _studentIdLetter = studentId ? studentId.charAt(0).toLowerCase() : "";
-    // Valid student ID format: campus-letter + exactly 6 digits (e.g. n200623, s120042)
-    const validStudentIdFormat = /^[a-z]\d{6}$/i;
+    // Missing course ID
+    if (!rowCourseId) {
+      errors.push({
+        id: `enroll-nocid-${i}`,
+        studentId,
+        name: name || undefined,
+        email,
+        courseId: "",
+        courseName: rowCourseName,
+        branch: detectedBranch as Branch,
+        errorType: "missing_course_id",
+        description: "Mismatch of course ID in uploaded data",
+        source,
+      });
+      continue;
+    }
 
-    // 1. Email format check
+    // Course ID format
+    if (!COURSE_ID_REGEX.test(rowCourseId.replace(/-_/g, ""))) {
+      errors.push({
+        id: `enroll-badcid-${i}`,
+        studentId,
+        name: name || undefined,
+        email,
+        courseId: rowCourseId,
+        courseName: rowCourseName,
+        branch: detectedBranch as Branch,
+        errorType: "invalid_course_id",
+        description: "Course ID format is invalid",
+        source,
+      });
+    }
+
+    // Missing email
     if (!email) {
       errors.push({
         id: `enroll-noemail-${i}`,
         studentId,
+        name: name || undefined,
         email: "(missing)",
-        courseId,
-        errorType: "Missing Email",
-        details: "No email provided",
-        courseName: courseName || undefined,
-        branch,
+        courseId: rowCourseId,
+        courseName: rowCourseName,
+        branch: detectedBranch as Branch,
+        errorType: "missing_email",
+        description: "Email not found in uploaded data",
+        source,
       });
-    } else if (!emailPattern.test(email)) {
+    } else if (
+      !isValidStudentEmail(email, campus) &&
+      !PERSONAL_EMAIL_REGEX.test(email)
+    ) {
       errors.push({
-        id: `enroll-email-${i}`,
+        id: `enroll-bademail-${i}`,
         studentId,
+        name: name || undefined,
         email,
-        courseId,
-        errorType: "Invalid Email",
-        details: "Invalid email format for this campus",
-        courseName: courseName || undefined,
-        branch,
+        courseId: rowCourseId,
+        courseName: rowCourseName,
+        branch: detectedBranch as Branch,
+        errorType: "invalid_email",
+        description: "Email format is invalid",
+        source,
       });
     }
 
-    // 2. Student ID format check (must be campus-letter + exactly 6 digits)
-    if (!studentId) {
-      errors.push({
-        id: `enroll-noid-${i}`,
-        studentId: "(missing)",
-        email,
-        courseId,
-        errorType: "Missing Student ID",
-        details: "No student ID provided",
-        courseName: courseName || undefined,
-        branch,
-      });
-    } else if (!validStudentIdFormat.test(studentId)) {
-      errors.push({
-        id: `enroll-idformat-${i}`,
-        studentId,
-        email,
-        courseId,
-        errorType: "Invalid Student ID Format",
-        details: "Invalid ID format (expected: campus letter + 6 digits)",
-        courseName: courseName || undefined,
-        branch,
-      });
-    } else if (!studentId.toLowerCase().startsWith(idPrefix)) {
-      // Student ID format is valid (letter + 6 digits) but wrong campus prefix
-      errors.push({
-        id: `enroll-id-${i}`,
-        studentId,
-        email,
-        courseId,
-        errorType: "Invalid Student ID Prefix",
-        details: "Wrong campus prefix in student ID",
-        courseName: courseName || undefined,
-        branch,
-      });
-    }
-
-    // ── Course ID Validation (3 independent points) ──
-
-    // Point 1: Check that a course ID column exists and has a value
-    if (!courseId) {
-      errors.push({
-        id: `enroll-nocourse-${i}`,
-        studentId,
-        email,
-        courseId: "(missing)",
-        errorType: "Missing Course ID",
-        details: "Mismatch of course id - in uploaded data by hod/dean",
-        courseName: courseName || undefined,
-        branch,
-      });
-    } else {
-      // Point 2: Enrollment course ID format must be noc<YY>-<subject> (hyphen separator)
-      // e.g. noc26-ec50
-      const enrollFormatRegex = /^noc\d{2}-[a-z0-9]+/i;
-      const courseYearMatch = courseId.match(/noc(\d{2})[-_]/i);
-
-      if (!enrollFormatRegex.test(courseId)) {
+    // 12-week course cross-match
+    if (courseIdSet.size > 0 && rowCourseId) {
+      const norm = rowCourseId.toLowerCase().trim();
+      if (!courseIdSet.has(norm)) {
         errors.push({
-          id: `enroll-format-${i}`,
+          id: `enroll-cmatch-${i}`,
           studentId,
+          name: name || undefined,
           email,
-          courseId,
-          errorType: "Invalid Course ID Format",
-          details: `Wrong course ID format (expected: noc${currentYear}-xxx for enrollment)`,
-          courseName: courseName || undefined,
-          branch,
+          courseId: rowCourseId,
+          courseName: rowCourseName,
+          branch: detectedBranch as Branch,
+          errorType: "course_mismatch",
+          description: "Course not found in 12-week course list",
+          source,
         });
-      } else if (courseYearMatch && courseYearMatch[1] !== currentYear) {
-        // Year mismatch (format is correct but year is wrong)
-        errors.push({
-          id: `enroll-year-${i}`,
-          studentId,
-          email,
-          courseId,
-          errorType: "Course ID Year Mismatch",
-          details: `Course ID year mismatch (expected noc${currentYear})`,
-          courseName: courseName || undefined,
-          branch,
-        });
-      }
-
-      // Course duration must be 12 weeks (separate check, independent)
-      if (durationWeeks !== undefined && durationWeeks !== 12) {
-        errors.push({
-          id: `enroll-duration-${i}`,
-          studentId,
-          email,
-          courseId,
-          errorType: "Invalid Course Duration",
-          details: "Course is not 12 weeks",
-          courseName: courseName || undefined,
-          branch,
-        });
-      }
-
-      // Point 3: Course ID must exist in dean's uploaded course file (only if course file uploaded)
-      if (uploadedCourseIds.length > 0) {
-        const normEnrollId = courseId.toLowerCase().trim();
-        const matchedCourse = uploadedCourses.find(
-          (c) => c.courseId.toLowerCase().trim() === normEnrollId,
-        );
-        if (
-          !matchedCourse &&
-          !uploadedCourseIds.some(
-            (c) => c.toLowerCase().trim() === normEnrollId,
-          )
-        ) {
-          errors.push({
-            id: `enroll-coursefile-${i}`,
-            studentId,
-            email,
-            courseId,
-            errorType: "Course Not in Course File",
-            details: "Course ID not found in dean's course file",
-            courseName: courseName || undefined,
-            branch,
-          });
-        } else if (matchedCourse && matchedCourse.durationWeeks !== 12) {
-          // Course found in file but is NOT a 12-week course
-          errors.push({
-            id: `enroll-not12week-${i}`,
-            studentId,
-            email,
-            courseId,
-            errorType: "Not a 12-week Course",
-            details: "Not a 12-week course",
-            courseName: courseName || undefined,
-            branch,
-          });
-        }
       }
     }
   }
@@ -906,665 +595,425 @@ export function validateEnrollmentRows(
   return { records, errors };
 }
 
-// ─── Parse & Validate Exam Registration Rows ──────────────────────────────────
-/**
- * Validates exam registration rows.
- * Payment Failed / Payment Complete = Done (registered)
- * Payment Pending / Payment Draft = Redo Registration
- * Anything else = Do First Registration
- *
- * Course ID format in exam reg uses underscores: ns_noc26_ec50
- *
- * 3-point course ID validation:
- * Point 1: Course ID column must exist and have a value
- * Point 2: Format must be ns_noc<YY>_<subject> (e.g. ns_noc26_ec50)
- * Point 3: Course ID (normalized) must exist in dean's uploaded course file
- *
- * Also validates email format for the campus (same as enrollment).
- */
-export function validateExamRegRows(
+// ─── Exam Reg Validator ───────────────────────────────────────────────────────
+
+export function validateExamRegErrors(
   rows: Record<string, string>[],
-  _enrollmentStudentIds: string[], // to cross-check
-  uploadedCourseIds: string[] = [], // from uploaded course file; empty means skip course-file check
-  collegeName = "", // used for email validation
-): ExamRegError[] {
+  campus: string,
+  _branch: string,
+  twelveWeekCourses: Course[],
+): { records: StudentUploadRecord[]; errors: ExamRegError[] } {
+  const records: StudentUploadRecord[] = [];
   const errors: ExamRegError[] = [];
-  const currentYear = new Date().getFullYear().toString().slice(-2); // "26" for 2026
+  const courseIdSet = new Set(
+    twelveWeekCourses.map((c) => c.courseId.toLowerCase().trim()),
+  );
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
 
-    const studentId = col(
-      row,
-      "Student ID",
-      "StudentID",
-      "student_id",
-      "Enrollment ID",
-      "EnrollmentID",
-      "enrollment_id",
-      "Roll No",
-      "Roll Number",
-      "Roll no",
-      "RollNo",
-      "rollno",
-      "rollnumber",
-      "Reg No",
-      "regno",
-      "Registration No",
-      "registrationno",
-      "Stud ID",
-      "studid",
-      "Student Roll No",
-      "StudentRollNo",
-      "STUDENT ID",
-      "Id No",
-      "idno",
-      "ID No",
-    );
+    const studentId = getVal(row, ROLL_NO_COLS);
+    const email = getVal(row, EMAIL_COLS);
+    const courseId = getVal(row, COURSE_ID_COLS);
+    const courseName = getVal(row, COURSE_NAME_COLS) || courseId;
+    const name = getVal(row, NAME_COLS);
+    const paymentStatus = getVal(row, PAYMENT_STATUS_COLS);
 
-    const email = col(
-      row,
-      "Email",
-      "Email ID",
-      "EmailID",
-      "email",
-      "email_id",
-      "Email Address",
-      "emailaddress",
-      "EMAIL",
-      "Email Id",
-      "emailid",
-      "College Email",
-      "collegeemail",
-      "Institute Email",
-      "instituteemail",
-      "Student Email",
-      "studentemail",
-      "Mail ID",
-      "mailid",
-      "College Email/Personal Email",
-      "Personal Email",
-      "personal_email",
-      "College/Personal Email",
-      "college_personal_email",
-    );
-
-    const courseId = col(
-      row,
-      "Course ID",
-      "CourseID",
-      "course_id",
-      "COURSE ID",
-      "Course Id",
-      "courseid",
-      "nptel course id",
-      "nptelcourseid",
-      "Exam Course ID",
-      "examcourseid",
-    );
-
-    const paymentStatus = col(
-      row,
-      "Payment Status",
-      "PaymentStatus",
-      "payment_status",
-      "Payment",
-      "Status",
-      "paymentstatus",
-      "Payment State",
-      "paymentstate",
-      "Exam Payment Status",
-      "exampaymentstatus",
-      "Transaction Status",
-      "transactionstatus",
-    );
-
-    const profession = col(
-      row,
-      "Profession",
-      "Role",
+    const profession = getVal(row, [
       "profession",
       "role",
-      "Type",
-      "User Type",
+      "type",
       "usertype",
-      "Category",
       "category",
-    );
+      "occupation",
+    ]);
+    if (profession.toLowerCase().includes("faculty")) continue;
+    if (!studentId && !email && !courseId) continue;
 
-    const courseName = col(
-      row,
-      "Course Name",
-      "CourseName",
-      "course_name",
-      "Course Title",
-      "coursetitle",
-      "Subject",
-    );
+    const detectedBranch = detectBranch(row);
 
-    // Skip empty rows
-    if (!studentId && !courseId) continue;
+    const record: StudentUploadRecord = {
+      studentId,
+      name: name || undefined,
+      email,
+      courseId,
+      courseName: courseName || undefined,
+      paymentStatus: paymentStatus || undefined,
+      branch: detectedBranch,
+      source: "dean",
+    };
+    records.push(record);
 
-    // Skip faculty rows
-    if (profession?.toLowerCase().includes("faculty")) continue;
+    const rowCourseName = courseName || courseId || "Unknown Course";
 
-    const branch = detectBranch(row) ?? "CSE";
-
-    // Classify payment status
-    const s = paymentStatus.toLowerCase().trim();
-    let classification: string;
-    let errorType: string;
-    let shouldAddError = false;
-
-    // Normalize: treat underscores the same as spaces (e.g. "payment_failed" === "payment failed")
-    const sNorm = s.replace(/_/g, " ");
-    if (
-      sNorm === "payment failed" ||
-      sNorm === "failed" ||
-      sNorm === "payment complete" ||
-      sNorm === "complete"
-    ) {
-      classification = "Done";
-      shouldAddError = false; // Done = registered successfully, no error
-    } else if (
-      sNorm === "payment pending" ||
-      sNorm === "pending" ||
-      sNorm === "payment draft" ||
-      sNorm === "draft"
-    ) {
-      classification = "Redo Registration";
-      errorType = sNorm.includes("draft") ? "Payment Draft" : "Payment Pending";
-      shouldAddError = true;
-    } else {
-      // Anything else = Do First Registration
-      classification = "Do First Registration";
-      errorType = "Not Registered";
-      shouldAddError = true;
-    }
-
-    if (shouldAddError) {
-      errors.push({
-        id: `examreg-pay-${i}`,
-        studentId,
-        email,
-        courseId,
-        paymentStatus,
-        classification,
-        // @ts-expect-error errorType is defined in shouldAddError=true branches
-        errorType,
-        details:
-          classification === "Redo Registration"
-            ? "Re-do registration required (payment pending)"
-            : "Registration not done",
-        courseName: courseName || undefined,
-        branch,
-      });
-    }
-
-    // ── Email validation for exam reg (same rules as enrollment) ──
-    if (collegeName) {
-      const emailPattern = getStudentEmailPattern(collegeName);
-      const _emailDomain = getStudentEmailDomain(collegeName);
-      if (!email) {
-        errors.push({
-          id: `examreg-noemail-${i}`,
-          studentId,
-          email: "(missing)",
-          courseId,
-          paymentStatus,
-          classification: "Invalid",
-          errorType: "Missing Email",
-          details: "No email provided",
-          courseName: courseName || undefined,
-          branch,
-        });
-      } else if (!emailPattern.test(email)) {
-        errors.push({
-          id: `examreg-email-${i}`,
-          studentId,
-          email,
-          courseId,
-          paymentStatus,
-          classification: "Invalid",
-          errorType: "Invalid Email",
-          details: "Invalid email format for this campus",
-          courseName: courseName || undefined,
-          branch,
-        });
-      }
-    }
-
-    // ── Course ID Validation (3 independent points) ──
-
-    // Point 1: Course ID column must exist and have a value
+    // Missing course ID
     if (!courseId) {
       errors.push({
-        id: `examreg-nocourse-${i}`,
+        id: `examreg-nocid-${i}`,
         studentId,
+        name: name || undefined,
         email,
-        courseId: "(missing)",
+        courseId: "",
+        courseName: rowCourseName,
+        branch: detectedBranch,
+        errorType: "missing_course_id",
+        description: "Mismatch of course ID in uploaded data",
         paymentStatus,
-        classification: "Invalid",
-        errorType: "Missing Course ID",
-        details: "Mismatch of course id - in uploaded data by hod/dean",
-        courseName: courseName || undefined,
-        branch,
       });
-    } else {
-      // Point 2: Exam Registration course ID format must be ns_noc<YY>_<subject> (underscore separators)
-      // e.g. ns_noc26_ec50
-      const examFormatRegex = /^ns_noc\d{2}_[a-z0-9]+/i;
-      const courseYearMatch = courseId.match(/noc(\d{2})_/i);
+      continue;
+    }
 
-      if (!examFormatRegex.test(courseId)) {
+    // Course ID format
+    if (!COURSE_ID_REGEX.test(courseId.replace(/[-_]/g, ""))) {
+      errors.push({
+        id: `examreg-badcid-${i}`,
+        studentId,
+        name: name || undefined,
+        email,
+        courseId,
+        courseName: rowCourseName,
+        branch: detectedBranch,
+        errorType: "invalid_course_id",
+        description: "Course ID format is invalid",
+        paymentStatus,
+      });
+    }
+
+    // Missing email
+    if (!email) {
+      errors.push({
+        id: `examreg-noemail-${i}`,
+        studentId,
+        name: name || undefined,
+        email: "(missing)",
+        courseId,
+        courseName: rowCourseName,
+        branch: detectedBranch,
+        errorType: "missing_email",
+        description: "Email not found in uploaded data",
+        paymentStatus,
+      });
+    } else if (
+      !isValidStudentEmail(email, campus) &&
+      !PERSONAL_EMAIL_REGEX.test(email)
+    ) {
+      errors.push({
+        id: `examreg-bademail-${i}`,
+        studentId,
+        name: name || undefined,
+        email,
+        courseId,
+        courseName: rowCourseName,
+        branch: detectedBranch,
+        errorType: "invalid_email",
+        description: "Email format is invalid",
+        paymentStatus,
+      });
+    }
+
+    // Payment issues
+    if (paymentStatus) {
+      const s = paymentStatus.toLowerCase().trim().replace(/[_\s]/g, "");
+      const isDone =
+        s === "paymentcomplete" ||
+        s === "complete" ||
+        s === "paymentsuccess" ||
+        s === "success";
+      const isRedo =
+        s === "paymentfailed" ||
+        s === "failed" ||
+        s === "paymentpending" ||
+        s === "pending" ||
+        s === "paymentdraft" ||
+        s === "draft";
+      if (isRedo && !isDone) {
         errors.push({
-          id: `examreg-format-${i}`,
+          id: `examreg-pay-${i}`,
           studentId,
+          name: name || undefined,
           email,
           courseId,
+          courseName: rowCourseName,
+          branch: detectedBranch,
+          errorType: "payment_issue",
+          description: "Registration not completed — action required",
           paymentStatus,
-          classification: "Invalid",
-          errorType: "Invalid Course ID Format",
-          details: `Wrong course ID format (expected: ns_noc${currentYear}_xxx for exam reg)`,
-          courseName: courseName || undefined,
-          branch,
         });
-      } else if (courseYearMatch && courseYearMatch[1] !== currentYear) {
-        // Year mismatch (format is correct but year is wrong)
+      } else if (!isDone && !isRedo) {
         errors.push({
-          id: `examreg-year-${i}`,
+          id: `examreg-noreg-${i}`,
           studentId,
+          name: name || undefined,
           email,
           courseId,
+          courseName: rowCourseName,
+          branch: detectedBranch,
+          errorType: "payment_issue",
+          description: "Registration not completed — action required",
           paymentStatus,
-          classification: "Invalid",
-          errorType: "Course ID Year Mismatch",
-          details: `Course ID year mismatch (expected noc${currentYear})`,
-          courseName: courseName || undefined,
-          branch,
         });
       }
+    }
 
-      // Point 3: Normalize exam reg ID to enrollment format for course file lookup
-      // ns_noc26_ec50 → noc26-ec50 (remove ns_ prefix, replace underscores with hyphens)
-      if (uploadedCourseIds.length > 0) {
-        const normalizedForLookup = courseId
-          .toLowerCase()
-          .trim()
-          .replace(/^ns_/, "") // remove ns_ prefix
-          .replace(/_/g, "-"); // replace underscores with hyphens for course file comparison
-        const foundInCourseFile = uploadedCourseIds.some(
-          (c) =>
-            c.toLowerCase().trim() === normalizedForLookup ||
-            c.toLowerCase().trim() === courseId.toLowerCase().trim(),
-        );
-        if (!foundInCourseFile) {
-          errors.push({
-            id: `examreg-coursefile-${i}`,
-            studentId,
-            email,
-            courseId,
-            paymentStatus,
-            classification: "Invalid",
-            errorType: "Course Not in Course File",
-            details: "Course ID not found in dean's course file",
-            courseName: courseName || undefined,
-            branch,
-          });
-        }
+    // 12-week cross-match
+    if (courseIdSet.size > 0) {
+      const norm = courseId
+        .toLowerCase()
+        .trim()
+        .replace(/^ns_/, "")
+        .replace(/_/g, "-");
+      if (
+        !courseIdSet.has(norm) &&
+        !courseIdSet.has(courseId.toLowerCase().trim())
+      ) {
+        errors.push({
+          id: `examreg-cmatch-${i}`,
+          studentId,
+          name: name || undefined,
+          email,
+          courseId,
+          courseName: rowCourseName,
+          branch: detectedBranch,
+          errorType: "course_mismatch",
+          description: "Course not found in 12-week course list",
+          paymentStatus,
+        });
       }
+    }
+  }
+
+  return { records, errors };
+}
+
+// ─── Shuffle Parser ───────────────────────────────────────────────────────────
+
+export function parseShuffleRows(
+  rows: Record<string, string>[],
+): ExamShuffleUploadRecord[] {
+  const records: ExamShuffleUploadRecord[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rollNo = getVal(row, ROLL_NO_COLS);
+    const name = getVal(row, NAME_COLS);
+    const examCenter = getVal(row, EXAM_CENTER_COLS);
+    const examDate = getVal(row, EXAM_DATE_COLS);
+    const timeSlot = getVal(row, TIME_SLOT_COLS);
+    const hallTicketNo = getVal(row, HALL_TICKET_COLS);
+    const courseId = getVal(row, COURSE_ID_COLS);
+    const courseName = getVal(row, COURSE_NAME_COLS);
+    const seatingNo = getVal(row, SEATING_COLS);
+
+    const profession = getVal(row, ["profession", "role", "type", "usertype"]);
+    if (profession.toLowerCase().includes("faculty")) continue;
+    if (!rollNo && !courseId) continue;
+
+    records.push({
+      rollNo: rollNo || "",
+      name: name || undefined,
+      examCenter: examCenter || undefined,
+      examDate: examDate || undefined,
+      timeSlot: timeSlot || undefined,
+      hallTicketNo: hallTicketNo || undefined,
+      courseId: courseId || undefined,
+      courseName: courseName || undefined,
+      seatingNo: seatingNo || undefined,
+    });
+  }
+  return records;
+}
+
+// ─── Cross-match ──────────────────────────────────────────────────────────────
+
+function normCourseId(id: string): string {
+  return id.trim().toLowerCase().replace(/^ns_/, "").replace(/_/g, "-");
+}
+
+export function crossMatchErrors(
+  enrollmentRecords: StudentUploadRecord[],
+  examRegRecords: StudentUploadRecord[],
+): EnrollmentError[] {
+  const errors: EnrollmentError[] = [];
+
+  const examRegSet = new Set<string>();
+  for (const r of examRegRecords) {
+    examRegSet.add(`${r.studentId.toLowerCase()}::${normCourseId(r.courseId)}`);
+  }
+
+  const enrollSet = new Set<string>();
+  for (const r of enrollmentRecords) {
+    enrollSet.add(`${r.studentId.toLowerCase()}::${normCourseId(r.courseId)}`);
+  }
+
+  for (const r of enrollmentRecords) {
+    const key = `${r.studentId.toLowerCase()}::${normCourseId(r.courseId)}`;
+    if (!examRegSet.has(key)) {
+      errors.push({
+        id: `xmatch-noexam-${r.studentId}-${r.courseId}`,
+        studentId: r.studentId,
+        name: r.name,
+        email: r.email,
+        courseId: r.courseId,
+        courseName: r.courseName || r.courseId,
+        branch: r.branch,
+        errorType: "not_registered",
+        description: "Student enrolled but not registered for exam",
+        source: r.source,
+      });
+    }
+  }
+
+  for (const r of examRegRecords) {
+    const key = `${r.studentId.toLowerCase()}::${normCourseId(r.courseId)}`;
+    if (!enrollSet.has(key)) {
+      errors.push({
+        id: `xmatch-noenroll-${r.studentId}-${r.courseId}`,
+        studentId: r.studentId,
+        name: r.name,
+        email: r.email,
+        courseId: r.courseId,
+        courseName: r.courseName || r.courseId,
+        branch: r.branch,
+        errorType: "not_enrolled",
+        description: "Student registered for exam but not enrolled",
+        source: "dean",
+      });
     }
   }
 
   return errors;
 }
 
-// ─── Parse Exam Shuffle File ──────────────────────────────────────────────────
-/**
- * Parses a dean-uploaded exam shuffle file (CSV or Excel).
- * Extracts exam center, date, slot, hall ticket, and course info per student.
- * All students in this file are included (regardless of payment status).
- */
-export function parseExamShuffleRows(
-  rows: Record<string, string>[],
-): ExamShuffleUploadRecord[] {
-  const records: ExamShuffleUploadRecord[] = [];
+// ─── Legacy compat exports ────────────────────────────────────────────────────
 
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
+export { parseFile as parseUploadedFile };
 
-    const studentId = col(
-      row,
-      "Student ID",
-      "StudentID",
-      "student_id",
-      "Roll No",
-      "RollNo",
-      "rollno",
-      "Roll Number",
-      "Reg No",
-      "regno",
-      "Registration No",
-      "Id No",
-      "idno",
-      "ID No",
-      "STUDENT ID",
-    );
-
-    const email = col(
-      row,
-      "Email",
-      "Email ID",
-      "EmailID",
-      "email",
-      "email_id",
-      "College Email",
-      "collegeemail",
-      "Institute Email",
-      "instituteemail",
-      "Student Email",
-      "Mail ID",
-      "mailid",
-    );
-
-    const courseId = col(
-      row,
-      "Course ID",
-      "CourseID",
-      "course_id",
-      "COURSE ID",
-      "nptel course id",
-      "nptelcourseid",
-      "Exam Course ID",
-      "examcourseid",
-      "Course Code",
-      "coursecode",
-    );
-
-    const courseName = col(
-      row,
-      "Course Name",
-      "CourseName",
-      "course_name",
-      "Course Title",
-      "coursetitle",
-      "Subject",
-    );
-
-    const examCenter = col(
-      row,
-      "Exam Center",
-      "ExamCenter",
-      "exam_center",
-      "Center",
-      "center",
-      "Exam Venue",
-      "examvenue",
-      "Venue",
-      "venue",
-      "City",
-      "city",
-      "Examination Center",
-      "examinationcenter",
-    );
-
-    const examDate = col(
-      row,
-      "Exam Date",
-      "ExamDate",
-      "exam_date",
-      "Date",
-      "date",
-      "Examination Date",
-      "examinationdate",
-      "Test Date",
-      "testdate",
-    );
-
-    const examSlot = col(
-      row,
-      "Slot",
-      "slot",
-      "Time Slot",
-      "timeslot",
-      "Exam Slot",
-      "examslot",
-      "Session",
-      "session",
-      "Time",
-      "time",
-      "Exam Time",
-      "examtime",
-    );
-
-    const hallTicketNo = col(
-      row,
-      "Hall Ticket No",
-      "HallTicketNo",
-      "hallticketno",
-      "Hall Ticket",
-      "hallticket",
-      "Ticket No",
-      "ticketno",
-      "Admit Card No",
-      "admitcardno",
-    );
-
-    const name = col(
-      row,
-      "Name",
-      "Student Name",
-      "studentname",
-      "Full Name",
-      "fullname",
-      "Candidate Name",
-      "candidatename",
-    );
-
-    const profession = col(
-      row,
-      "Profession",
-      "Role",
-      "profession",
-      "role",
-      "Type",
-      "User Type",
-      "usertype",
-    );
-
-    const seatingNumber = col(
-      row,
-      "Seating Number",
-      "seatingnumber",
-      "seating_number",
-      "Seating No",
-      "seatingno",
-      "Seating Position",
-      "seatingposition",
-      "seating_position",
-      "Seat No",
-      "seatno",
-      "Seat Number",
-      "seatnumber",
-      "Seat",
-      "seat",
-    );
-
-    // Skip completely empty rows
-    if (!studentId && !email && !courseId) continue;
-
-    // Skip faculty rows
-    if (profession?.toLowerCase().includes("faculty")) continue;
-
-    const branch = detectBranch(row) ?? "CSE";
-
-    records.push({
-      studentId: studentId || "",
-      email: email || "",
-      name: name || undefined,
-      branch,
-      courseId: courseId || "",
-      courseName: courseName || undefined,
-      examCenter: examCenter || undefined,
-      examDate: examDate || undefined,
-      examSlot: examSlot || undefined,
-      hallTicketNo: hallTicketNo || undefined,
-      seatingNumber: seatingNumber || undefined,
-    });
-  }
-
-  return records;
+export function getFileHeaders(rows: Record<string, string>[]): string[] {
+  if (rows.length === 0) return [];
+  return Object.keys(rows[0]);
 }
 
-// ─── Parse Student Records from Exam Reg File (for statistics) ───────────────
+export async function parseCSVFile(
+  file: File,
+): Promise<Record<string, string>[]> {
+  return parseFile(file);
+}
+
+export async function parseExcelFile(
+  file: File,
+): Promise<Record<string, string>[]> {
+  return parseFile(file);
+}
+
+export function parseCourseRows(rows: Record<string, string>[]): Course[] {
+  const courses: Course[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const courseId = getVal(row, COURSE_ID_COLS);
+    const courseName = getVal(row, COURSE_NAME_COLS);
+    const durationRaw = getVal(row, DURATION_COLS);
+    if (!courseId && !courseName) continue;
+    const weekCount = Number.parseInt(durationRaw, 10) || 0;
+    if (durationRaw && weekCount !== 12) continue;
+    courses.push({
+      courseId: courseId || `course-${i}`,
+      courseName: courseName || courseId || `Course ${i + 1}`,
+      duration: durationRaw || "12 weeks",
+      weekCount: 12,
+    });
+  }
+  return courses;
+}
+
 export function parseExamRegRecords(
   rows: Record<string, string>[],
 ): StudentUploadRecord[] {
-  const records: StudentUploadRecord[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const studentId = col(
-      row,
-      "Student ID",
-      "StudentID",
-      "student_id",
-      "Enrollment ID",
-      "Roll No",
-      "RollNo",
-      "rollno",
-      "Reg No",
-    );
-    const courseId = col(row, "Course ID", "CourseID", "course_id", "courseid");
-    const paymentStatus = col(
-      row,
-      "Payment Status",
-      "PaymentStatus",
-      "payment_status",
-      "Payment",
-      "Status",
-      "paymentstatus",
-    );
-    const profession = col(
-      row,
-      "Profession",
-      "Role",
-      "profession",
-      "role",
-      "Type",
-      "User Type",
-      "usertype",
-    );
-
-    if (!studentId && !courseId) continue;
-    if (profession?.toLowerCase().includes("faculty")) continue;
-
-    const branch = detectBranch(row) ?? "CSE";
-
-    records.push({
-      studentId,
-      email: col(row, "Email", "Email ID", "EmailID", "email"),
-      courseId: courseId.replace(/_/g, "-"), // normalize for internal use
-      examCourseId: courseId,
-      paymentStatus,
-      branch,
-      profession: profession || "Student",
-    });
-  }
+  const { records } = validateExamRegErrors(rows, "", "", []);
   return records;
 }
 
-// ─── Cross-match Enrollment vs Exam Registration ──────────────────────────────
+export function validateEnrollmentRows(
+  rows: Record<string, string>[],
+  collegeName = "",
+  _uploadedCourseIds: string[] = [],
+  uploadedCourses: Course[] = [],
+): { records: StudentUploadRecord[]; errors: EnrollmentError[] } {
+  return validateEnrollmentErrors(
+    rows,
+    collegeName,
+    "CSE",
+    "dean",
+    uploadedCourses,
+  );
+}
 
+export function validateExamRegRows(
+  rows: Record<string, string>[],
+  _enrollmentStudentIds: string[] = [],
+  _uploadedCourseIds: string[] = [],
+  collegeName = "",
+): ExamRegError[] {
+  const { errors } = validateExamRegErrors(rows, collegeName, "CSE", []);
+  return errors;
+}
+
+export function parseExamShuffleRows(
+  rows: Record<string, string>[],
+): import("../data/mockData").ExamShuffleUploadRecord[] {
+  return parseShuffleRows(rows).map((r) => ({
+    rollNo: r.rollNo,
+    studentId: r.rollNo,
+    email: "",
+    name: r.name,
+    branch: "CSE" as Branch,
+    courseId: r.courseId || "",
+    courseName: r.courseName,
+    examCenter: r.examCenter,
+    examDate: r.examDate,
+    examSlot: r.timeSlot,
+    timeSlot: r.timeSlot,
+    hallTicketNo: r.hallTicketNo,
+    seatingNumber: r.seatingNo,
+    seatingNo: r.seatingNo,
+  }));
+}
+
+export function crossMatchEnrollmentExamReg(
+  enrollmentRecords: StudentUploadRecord[],
+  examRegRecords: StudentUploadRecord[],
+  _uploadedCourses: Course[],
+): Array<{
+  studentId: string;
+  email: string;
+  courseId: string;
+  courseName?: string;
+  errorType: string;
+  details: string;
+  branch: string;
+}> {
+  return crossMatchErrors(enrollmentRecords, examRegRecords).map((e) => ({
+    studentId: e.studentId,
+    email: e.email,
+    courseId: e.courseId,
+    courseName: e.courseName,
+    errorType:
+      e.errorType === "not_registered"
+        ? "Missing Exam Registration"
+        : "Missing Enrollment",
+    details: e.description,
+    branch: e.branch,
+  }));
+}
+
+// CrossMatchError type alias for legacy imports
 export interface CrossMatchError {
   studentId: string;
   email: string;
   courseId: string;
   courseName?: string;
-  errorType: "Missing Exam Registration" | "Missing Enrollment";
+  errorType: string;
   details: string;
   branch: string;
 }
 
-/** Normalize a course ID to enrollment format: noc26-ec50 */
-function normalizeCourseId(id: string): string {
-  return id.trim().toLowerCase().replace(/^ns_/, "").replace(/_/g, "-");
-}
-
-/**
- * Cross-checks enrollment records against exam registration records for 12-week courses.
- * - Enrolled in a 12-week course but no exam reg found → "Missing Exam Registration"
- * - Exam reg for a 12-week course but no enrollment found → "Missing Enrollment"
- */
-export function crossMatchEnrollmentExamReg(
-  enrollmentRecords: StudentUploadRecord[],
-  examRegRecords: StudentUploadRecord[],
-  uploadedCourses: Course[],
-): CrossMatchError[] {
-  const errors: CrossMatchError[] = [];
-  const twelveWeekCourseIds = new Set(
-    uploadedCourses.map((c) => normalizeCourseId(c.courseId)),
-  );
-  if (twelveWeekCourseIds.size === 0) return errors;
-
-  const courseNameMap = new Map(
-    uploadedCourses.map((c) => [normalizeCourseId(c.courseId), c.courseName]),
-  );
-
-  // Build set of {studentId}::{courseId} from exam reg
-  const examRegSet = new Set<string>();
-  for (const r of examRegRecords) {
-    const normCourse = normalizeCourseId(r.examCourseId ?? r.courseId);
-    if (twelveWeekCourseIds.has(normCourse)) {
-      examRegSet.add(`${r.studentId.trim().toLowerCase()}::${normCourse}`);
-    }
-  }
-
-  // Build set of {studentId}::{courseId} from enrollment
-  const enrollSet = new Set<string>();
-  for (const r of enrollmentRecords) {
-    const normCourse = normalizeCourseId(r.courseId);
-    if (twelveWeekCourseIds.has(normCourse)) {
-      enrollSet.add(`${r.studentId.trim().toLowerCase()}::${normCourse}`);
-    }
-  }
-
-  // Check enrollment → exam reg
-  for (const r of enrollmentRecords) {
-    const normCourse = normalizeCourseId(r.courseId);
-    if (!twelveWeekCourseIds.has(normCourse)) continue;
-    const key = `${r.studentId.trim().toLowerCase()}::${normCourse}`;
-    if (!examRegSet.has(key)) {
-      errors.push({
-        studentId: r.studentId,
-        email: r.email,
-        courseId: r.courseId,
-        courseName: r.courseName ?? courseNameMap.get(normCourse),
-        errorType: "Missing Exam Registration",
-        details:
-          "Enrolled in this 12-week course but no exam registration found",
-        branch: r.branch,
-      });
-    }
-  }
-
-  // Check exam reg → enrollment
-  for (const r of examRegRecords) {
-    const normCourse = normalizeCourseId(r.examCourseId ?? r.courseId);
-    if (!twelveWeekCourseIds.has(normCourse)) continue;
-    const key = `${r.studentId.trim().toLowerCase()}::${normCourse}`;
-    if (!enrollSet.has(key)) {
-      errors.push({
-        studentId: r.studentId,
-        email: r.email,
-        courseId: r.examCourseId ?? r.courseId,
-        courseName: r.courseName ?? courseNameMap.get(normCourse),
-        errorType: "Missing Enrollment",
-        details:
-          "Exam registration found but no enrollment record for this course",
-        branch: r.branch,
-      });
-    }
-  }
-
-  return errors;
-}
+// loadXLSXLib re-export for legacy DeanDashboard usage
+export { loadXLSX as loadXLSXLib };

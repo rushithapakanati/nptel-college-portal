@@ -7,14 +7,30 @@ import {
   createRouter,
   redirect,
 } from "@tanstack/react-router";
+import { Suspense, lazy } from "react";
 import { AppProvider } from "./context/AppContext";
+// Small pages kept in the main bundle — needed immediately on load
 import CollegeSelectPage from "./pages/CollegeSelectPage";
-import DeanDashboard from "./pages/DeanDashboard";
-import HODDashboard from "./pages/HODDashboard";
 import LoginPage from "./pages/LoginPage";
 import PortalPage from "./pages/PortalPage";
-import StudentDashboard from "./pages/StudentDashboard";
 import YearSelectPage from "./pages/YearSelectPage";
+
+// Heavy dashboard pages — lazy-loaded to reduce initial bundle size
+const DeanDashboard = lazy(() => import("./pages/DeanDashboard"));
+const HODDashboard = lazy(() => import("./pages/HODDashboard"));
+const StudentDashboard = lazy(() => import("./pages/StudentDashboard"));
+
+// ── Suspense fallback ─────────────────────────────────────────────────────────
+function PageLoader() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="flex flex-col items-center gap-3 text-muted-foreground">
+        <div className="h-8 w-8 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+        <span className="text-sm">Loading dashboard…</span>
+      </div>
+    </div>
+  );
+}
 
 // ── Root route ────────────────────────────────────────────────────────────────
 const rootRoute = createRootRoute({
@@ -26,7 +42,7 @@ const rootRoute = createRootRoute({
   ),
 });
 
-// ── Year select (new homepage) ────────────────────────────────────────────────
+// ── Year select (homepage) ────────────────────────────────────────────────────
 const homeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
@@ -40,7 +56,7 @@ const portalRoute = createRoute({
   component: PortalPage,
 });
 
-// ── College select ────────────────────────────────────────────────────────────
+// ── College select (role selection) ──────────────────────────────────────────
 const collegeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/college/$collegeName",
@@ -58,21 +74,33 @@ const loginRoute = createRoute({
 const studentRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/college/$collegeName/student",
-  component: StudentDashboard,
+  component: () => (
+    <Suspense fallback={<PageLoader />}>
+      <StudentDashboard />
+    </Suspense>
+  ),
 });
 
 // ── HOD dashboard ─────────────────────────────────────────────────────────────
 const hodRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/college/$collegeName/hod/$branch",
-  component: HODDashboard,
+  component: () => (
+    <Suspense fallback={<PageLoader />}>
+      <HODDashboard />
+    </Suspense>
+  ),
 });
 
 // ── Dean dashboard ────────────────────────────────────────────────────────────
 const deanRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/college/$collegeName/dean",
-  component: DeanDashboard,
+  component: () => (
+    <Suspense fallback={<PageLoader />}>
+      <DeanDashboard />
+    </Suspense>
+  ),
 });
 
 // ── Catch-all → home ──────────────────────────────────────────────────────────

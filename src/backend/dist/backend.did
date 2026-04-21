@@ -1,0 +1,195 @@
+type OverviewStats = 
+ record {
+   cleanEnrollment: nat;
+   enrollmentErrors: nat;
+   examRegDoFirst: nat;
+   examRegDone: nat;
+   examRegErrors: nat;
+   examRegRedo: nat;
+   totalEnrolled: nat;
+   totalRegistered: nat;
+ };
+type HODPermission = 
+ record {
+   branch: text;
+   college: text;
+   editCredits: nat;
+   uploadCredits: nat;
+   yearKey: text;
+ };
+type FileSnapshot = 
+ record {
+   filename: text;
+   id: text;
+   isActive: bool;
+   recordCount: nat;
+   timestamp: int;
+ };
+type ExamShuffleRecord = 
+ record {
+   branch: text;
+   college: text;
+   courseId: text;
+   courseName: text;
+   email: text;
+   examCenter: text;
+   examDate: text;
+   hallTicketNo: text;
+   id: text;
+   rollNo: text;
+   seatingPosition: text;
+   studentId: text;
+   timeSlot: text;
+   yearKey: text;
+ };
+type ExamShufflePage = 
+ record {
+   data: vec ExamShuffleRecord;
+   hasMore: bool;
+   totalCount: nat;
+ };
+type ExamRegRecord = 
+ record {
+   branch: text;
+   college: text;
+   courseId: text;
+   courseName: text;
+   email: text;
+   errorDescription: text;
+   errorType: text;
+   hasError: bool;
+   id: text;
+   paymentStatus: text;
+   registrationStatus: text;
+   studentId: text;
+   yearKey: text;
+ };
+type ExamRegPage = 
+ record {
+   data: vec ExamRegRecord;
+   hasMore: bool;
+   totalCount: nat;
+ };
+type EnrollmentRecord = 
+ record {
+   branch: text;
+   college: text;
+   courseId: text;
+   courseName: text;
+   duration: text;
+   email: text;
+   errorDescription: text;
+   errorType: text;
+   hasError: bool;
+   id: text;
+   status: text;
+   studentId: text;
+   yearKey: text;
+ };
+type EnrollmentPage = 
+ record {
+   data: vec EnrollmentRecord;
+   hasMore: bool;
+   totalCount: nat;
+ };
+type EditedRecord = 
+ record {
+   branch: text;
+   college: text;
+   editedBy: text;
+   field: text;
+   id: text;
+   newValue: text;
+   oldValue: text;
+   recordType: text;
+   studentId: text;
+   timestamp: int;
+   yearKey: text;
+ };
+type CourseRecord = 
+ record {
+   category: text;
+   college: text;
+   courseId: text;
+   courseName: text;
+   duration: text;
+   yearKey: text;
+ };
+type BranchStats = 
+ record {
+   branch: text;
+   enrollmentErrors: nat;
+   enrollmentTotal: nat;
+   examRegDoFirst: nat;
+   examRegDone: nat;
+   examRegErrors: nat;
+   examRegRedo: nat;
+   examRegTotal: nat;
+ };
+service : {
+  editEnrollmentRecord: (college: text, yearKey: text, branch: text,
+   recordId: text, updated: EnrollmentRecord, editorId: text, field: 
+   text, oldValue: text, newValue: text) -> (bool);
+  editExamRegRecord: (college: text, yearKey: text, branch: text, recordId:
+   text, updated: ExamRegRecord, editorId: text, field: text, oldValue: 
+   text, newValue: text) -> (bool);
+  getAllCourses: (college: text, yearKey: text) -> (vec CourseRecord) query;
+  getAllEditedRecords: (college: text, yearKey: text) ->
+   (vec EditedRecord) query;
+  getAllEnrollmentErrors: (college: text, yearKey: text) ->
+   (vec EnrollmentRecord) query;
+  getAllEnrollmentRecords: (college: text, yearKey: text) ->
+   (vec EnrollmentRecord) query;
+  getAllExamRegErrors: (college: text, yearKey: text) ->
+   (vec ExamRegRecord) query;
+  getAllExamRegRecords: (college: text, yearKey: text) ->
+   (vec ExamRegRecord) query;
+  getAllExamShuffle: (college: text, yearKey: text) ->
+   (vec ExamShuffleRecord) query;
+  getAllHODPermissions: (college: text, yearKey: text) ->
+   (vec HODPermission) query;
+  getCoursesByBranchAndCollege: (college: text, yearKey: text, branch:
+   opt text) -> (vec CourseRecord) query;
+  getEditedRecords: (college: text, yearKey: text, branch: text) ->
+   (vec EditedRecord) query;
+  getEnrollmentByBranch: (college: text, yearKey: text, branch: text) ->
+   (vec EnrollmentRecord) query;
+  getEnrollmentRecordsPaged: (college: text, yearKey: text, branch: opt text,
+   errorOnly: opt bool, offset: nat, limit: nat) -> (EnrollmentPage) query;
+  getExamRegByBranch: (college: text, yearKey: text, branch: text) ->
+   (vec ExamRegRecord) query;
+  getExamRegRecordsPaged: (college: text, yearKey: text, branch: opt text,
+   errorOnly: opt bool, offset: nat, limit: nat) -> (ExamRegPage) query;
+  getExamShuffleByStudent: (college: text, yearKey: text, studentId: 
+   text) -> (vec ExamShuffleRecord) query;
+  getExamShufflePaged: (college: text, yearKey: text, offset: nat, limit:
+   nat) -> (ExamShufflePage) query;
+  getFileSnapshots: (college: text, yearKey: text, fileType: text) ->
+   (vec FileSnapshot) query;
+  getHODPermission: (college: text, yearKey: text, branch: text) ->
+   (opt HODPermission) query;
+  getOverviewStats: (college: text, yearKey: text) -> (OverviewStats);
+  getStatsByBranch: (college: text, yearKey: text, branch: text) ->
+   (BranchStats);
+  getStudentEnrollment: (college: text, yearKey: text, studentId: text) ->
+   (vec EnrollmentRecord) query;
+  getStudentExamReg: (college: text, yearKey: text, studentId: text) ->
+   (vec ExamRegRecord) query;
+  isShuffleUploaded: (college: text, yearKey: text) -> (bool) query;
+  restoreSnapshot: (college: text, yearKey: text, fileType: text, snapshotId:
+   text) -> (bool);
+  setHODPermission: (college: text, yearKey: text, branch: text,
+   uploadCredits: nat, editCredits: nat) -> ();
+  uploadCourses: (_college: text, yearKey: text, records:
+   vec CourseRecord) -> ();
+  uploadEnrollmentRecords: (college: text, yearKey: text, branch: text,
+   records: vec EnrollmentRecord) -> (bool);
+  uploadEnrollmentRecordsDean: (college: text, yearKey: text, fileId: 
+   text, fileName: text, records: vec EnrollmentRecord) -> ();
+  uploadExamRegRecords: (college: text, yearKey: text, branch: text, records:
+   vec ExamRegRecord) -> (bool);
+  uploadExamRegRecordsDean: (college: text, yearKey: text, fileId: text,
+   fileName: text, records: vec ExamRegRecord) -> ();
+  uploadExamShuffleRecords: (college: text, yearKey: text, fileId: text,
+   fileName: text, records: vec ExamShuffleRecord) -> ();
+}

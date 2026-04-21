@@ -1,5 +1,3 @@
-import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -8,25 +6,30 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useNavigate } from "@tanstack/react-router";
-import { CalendarDays, GraduationCap } from "lucide-react";
+import { GraduationCap } from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
 import { useAppContext } from "../context/AppContext";
+import { ACADEMIC_YEARS } from "../data/mockData";
 
-const ACADEMIC_YEARS = [
-  { value: "2026-sem1", label: "2026 Sem-1" },
-  { value: "2026-sem2", label: "2026 Sem-2" },
-];
+// Map raw values to display labels
+const YEAR_OPTIONS: { label: string; value: string }[] = ACADEMIC_YEARS.map(
+  (y) => ({ label: y, value: y.toLowerCase().replace(/\s+/g, "-") }),
+);
 
 export default function YearSelectPage() {
   const { setSelectedAcademicYear } = useAppContext();
   const navigate = useNavigate();
   const [selectedYear, setSelectedYear] = useState<string>("");
 
-  function handleProceed() {
+  function handleEnterPortal() {
     if (!selectedYear) return;
     setSelectedAcademicYear(selectedYear);
     navigate({ to: "/portal" });
+  }
+
+  function handleYearChange(value: string) {
+    setSelectedYear(value);
   }
 
   return (
@@ -34,130 +37,165 @@ export default function YearSelectPage() {
       className="min-h-screen flex flex-col items-center justify-center relative overflow-hidden"
       style={{
         background:
-          "linear-gradient(135deg, oklch(0.15 0.07 264) 0%, oklch(0.22 0.10 264) 40%, oklch(0.30 0.13 264) 100%)",
+          "linear-gradient(160deg, oklch(0.12 0.07 264) 0%, oklch(0.18 0.10 264) 45%, oklch(0.26 0.12 264) 100%)",
       }}
     >
-      {/* Decorative radial glows */}
+      {/* Animated radial gradient glows */}
       <div
         className="absolute inset-0 pointer-events-none"
+        aria-hidden="true"
         style={{
           backgroundImage: `
-            radial-gradient(ellipse at 15% 40%, oklch(0.55 0.18 264 / 0.18) 0%, transparent 55%),
-            radial-gradient(ellipse at 85% 20%, oklch(0.75 0.16 85 / 0.12) 0%, transparent 45%),
-            radial-gradient(ellipse at 50% 90%, oklch(0.45 0.14 264 / 0.10) 0%, transparent 50%)
+            radial-gradient(ellipse 65% 55% at 15% 35%, oklch(0.50 0.22 264 / 0.20) 0%, transparent 60%),
+            radial-gradient(ellipse 50% 45% at 85% 20%, oklch(0.78 0.16 85 / 0.16) 0%, transparent 55%),
+            radial-gradient(ellipse 75% 45% at 50% 95%, oklch(0.40 0.14 264 / 0.15) 0%, transparent 55%)
           `,
+          animation: "pulse 8s ease-in-out infinite alternate",
+        }}
+      />
+
+      {/* Grid overlay pattern */}
+      <div
+        className="absolute inset-0 pointer-events-none opacity-[0.04]"
+        aria-hidden="true"
+        style={{
+          backgroundImage:
+            "linear-gradient(oklch(1 0 0 / 1) 1px, transparent 1px), linear-gradient(90deg, oklch(1 0 0 / 1) 1px, transparent 1px)",
+          backgroundSize: "40px 40px",
         }}
       />
 
       <motion.div
-        initial={{ opacity: 0, y: 32 }}
+        initial={{ opacity: 0, y: 44 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.7, ease: "easeOut" }}
-        className="relative z-10 flex flex-col items-center gap-8 w-full max-w-md px-6"
+        transition={{ duration: 0.75, ease: [0.16, 1, 0.3, 1] }}
+        className="relative z-10 flex flex-col items-center gap-7 w-full max-w-lg px-6"
       >
-        {/* Logo */}
+        {/* Logo Icon */}
         <motion.div
-          initial={{ scale: 0.8, opacity: 0 }}
+          initial={{ scale: 0.7, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
-          transition={{ duration: 0.5, delay: 0.15 }}
-          className="flex items-center justify-center"
+          transition={{ duration: 0.6, delay: 0.1, ease: "backOut" }}
         >
           <div
-            className="w-24 h-24 rounded-full flex items-center justify-center shadow-2xl border-4"
+            className="w-24 h-24 rounded-full flex items-center justify-center"
             style={{
               background:
-                "linear-gradient(135deg, oklch(0.35 0.15 264) 0%, oklch(0.50 0.18 264) 100%)",
-              borderColor: "oklch(0.80 0.16 85)",
+                "linear-gradient(145deg, oklch(0.28 0.18 264) 0%, oklch(0.46 0.22 264) 100%)",
               boxShadow:
-                "0 0 40px oklch(0.55 0.18 264 / 0.5), 0 8px 32px rgba(0,0,0,0.4)",
+                "0 0 0 4px oklch(0.75 0.16 85), 0 0 56px oklch(0.42 0.22 264 / 0.60), 0 8px 32px oklch(0.08 0.05 264 / 0.65)",
             }}
           >
-            <GraduationCap className="h-12 w-12 text-yellow-300" />
+            <GraduationCap
+              className="h-12 w-12"
+              style={{ color: "oklch(0.97 0.10 85)" }}
+            />
           </div>
         </motion.div>
 
         {/* Title */}
         <motion.div
-          initial={{ opacity: 0, y: 16 }}
+          initial={{ opacity: 0, y: 22 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, delay: 0.25 }}
-          className="text-center"
+          transition={{ duration: 0.55, delay: 0.22 }}
+          className="text-center space-y-2"
         >
           <h1
-            className="font-display font-bold text-3xl sm:text-4xl tracking-tight leading-tight"
-            style={{ color: "oklch(0.97 0.02 85)" }}
+            className="font-display font-bold text-2xl sm:text-3xl lg:text-4xl tracking-tight leading-tight"
+            style={{ color: "oklch(0.97 0.04 85)" }}
           >
-            RGUKT NPTEL PORTAL
+            WELCOME TO RGUKT NPTEL WEBSITE
           </h1>
           <p
-            className="mt-3 text-base font-medium"
-            style={{ color: "oklch(0.75 0.08 264)" }}
+            className="text-base font-semibold tracking-widest uppercase"
+            style={{ color: "oklch(0.62 0.10 264)" }}
           >
-            Select Academic Year to Continue
+            RGUKT NPTEL PORTAL
           </p>
         </motion.div>
 
-        {/* Card */}
+        {/* Year selector card */}
         <motion.div
-          initial={{ opacity: 0, y: 20 }}
+          initial={{ opacity: 0, y: 28 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.55, delay: 0.35 }}
-          className="w-full rounded-2xl p-8 flex flex-col gap-6"
+          transition={{ duration: 0.55, delay: 0.34 }}
+          className="w-full rounded-2xl p-7 flex flex-col gap-5"
           style={{
-            background: "oklch(0.20 0.07 264 / 0.85)",
-            border: "1px solid oklch(0.40 0.10 264 / 0.5)",
+            background: "oklch(0.16 0.07 264 / 0.90)",
+            border: "1px solid oklch(0.40 0.10 264 / 0.50)",
             boxShadow:
-              "0 4px 40px oklch(0.15 0.07 264 / 0.6), 0 1px 0 oklch(0.45 0.12 264 / 0.2) inset",
-            backdropFilter: "blur(12px)",
+              "0 8px 48px oklch(0.10 0.06 264 / 0.55), 0 1px 0 oklch(0.50 0.14 264 / 0.20) inset",
+            backdropFilter: "blur(20px)",
           }}
         >
-          <div className="flex flex-col gap-2">
-            <Label
-              htmlFor="academic-year-select"
-              className="flex items-center gap-2 text-sm font-semibold"
-              style={{ color: "oklch(0.80 0.10 264)" }}
+          <div className="text-center">
+            <p
+              className="text-sm font-medium"
+              style={{ color: "oklch(0.65 0.08 264)" }}
             >
-              <CalendarDays className="h-4 w-4" />
-              Academic Year
-            </Label>
-            <Select value={selectedYear} onValueChange={setSelectedYear}>
-              <SelectTrigger
-                id="academic-year-select"
-                data-ocid="yearselect.select"
-                className="w-full h-12 text-base"
-                style={{
-                  background: "oklch(0.25 0.08 264 / 0.8)",
-                  borderColor: "oklch(0.42 0.12 264 / 0.6)",
-                  color: selectedYear
-                    ? "oklch(0.95 0.03 85)"
-                    : "oklch(0.60 0.07 264)",
-                }}
-              >
-                <SelectValue placeholder="Choose a semester..." />
-              </SelectTrigger>
-              <SelectContent>
-                {ACADEMIC_YEARS.map((yr) => (
-                  <SelectItem key={yr.value} value={yr.value}>
-                    {yr.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              Select Academic Year &amp; Semester to Access the Portal
+            </p>
           </div>
 
-          <Button
-            data-ocid="yearselect.primary_button"
-            onClick={handleProceed}
+          <Select value={selectedYear} onValueChange={handleYearChange}>
+            <SelectTrigger
+              id="academic-year-select"
+              data-ocid="yearselect.select"
+              className="w-full h-12 text-base font-semibold"
+              style={{
+                background: "oklch(0.22 0.09 264 / 0.90)",
+                borderColor: "oklch(0.42 0.12 264 / 0.65)",
+                color: selectedYear
+                  ? "oklch(0.97 0.04 85)"
+                  : "oklch(0.55 0.07 264)",
+              }}
+            >
+              <SelectValue placeholder="Select Academic Year / Semester" />
+            </SelectTrigger>
+            <SelectContent>
+              {YEAR_OPTIONS.map((yr) => (
+                <SelectItem
+                  key={yr.value}
+                  value={yr.value}
+                  className="text-base font-medium"
+                >
+                  {yr.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <button
+            type="button"
+            data-ocid="yearselect.enter_button"
             disabled={!selectedYear}
-            className="w-full h-12 text-base font-bold tracking-wide transition-all duration-200"
-            style={{
-              background: selectedYear
-                ? "linear-gradient(90deg, oklch(0.45 0.18 264) 0%, oklch(0.52 0.20 264) 100%)"
-                : undefined,
-            }}
+            onClick={handleEnterPortal}
+            className="w-full h-12 rounded-lg font-display font-bold text-base tracking-wide transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed"
+            style={
+              selectedYear
+                ? {
+                    background:
+                      "linear-gradient(135deg, oklch(0.42 0.18 264) 0%, oklch(0.55 0.20 264) 100%)",
+                    color: "oklch(0.97 0.04 85)",
+                    boxShadow:
+                      "0 4px 20px oklch(0.42 0.18 264 / 0.55), 0 1px 0 oklch(1 0 0 / 0.12) inset",
+                  }
+                : {
+                    background: "oklch(0.28 0.07 264 / 0.70)",
+                    color: "oklch(0.55 0.07 264)",
+                    border: "1px solid oklch(0.38 0.08 264 / 0.50)",
+                  }
+            }
           >
-            Proceed to Portal
-          </Button>
+            Enter Portal
+          </button>
+
+          <p
+            className="text-xs text-center"
+            style={{ color: "oklch(0.48 0.06 264)" }}
+          >
+            Each semester maintains its own separate database
+          </p>
         </motion.div>
       </motion.div>
     </div>

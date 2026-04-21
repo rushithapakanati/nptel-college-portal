@@ -1,0 +1,176 @@
+// Version: 1.0.0
+type BranchStats__130335619 =
+  {
+    branch : Text;
+    enrollmentErrors : Nat;
+    enrollmentTotal : Nat;
+    examRegDoFirst : Nat;
+    examRegDone : Nat;
+    examRegErrors : Nat;
+    examRegRedo : Nat;
+    examRegTotal : Nat
+  };
+type CourseRecord__245956781 =
+  {
+    category : Text;
+    college : Text;
+    courseId : Text;
+    courseName : Text;
+    duration : Text;
+    yearKey : Text
+  };
+type Data__791452850<K, V> =
+  {var count : Nat__490723111; kvs : [var ?(K, V)]};
+type EditedRecord__389897775 =
+  {
+    branch : Text;
+    college : Text;
+    editedBy : Text;
+    field : Text;
+    id : Text;
+    newValue : Text;
+    oldValue : Text;
+    recordType : Text;
+    studentId : Text;
+    timestamp : Int;
+    yearKey : Text
+  };
+type EnrollmentRecord__975602187 =
+  {
+    branch : Text;
+    college : Text;
+    courseId : Text;
+    courseName : Text;
+    duration : Text;
+    email : Text;
+    errorDescription : Text;
+    errorType : Text;
+    hasError : Bool;
+    id : Text;
+    status : Text;
+    studentId : Text;
+    yearKey : Text
+  };
+type ExamRegRecord__262967610 =
+  {
+    branch : Text;
+    college : Text;
+    courseId : Text;
+    courseName : Text;
+    email : Text;
+    errorDescription : Text;
+    errorType : Text;
+    hasError : Bool;
+    id : Text;
+    paymentStatus : Text;
+    registrationStatus : Text;
+    studentId : Text;
+    yearKey : Text
+  };
+type ExamShuffleRecord__95838409 =
+  {
+    branch : Text;
+    college : Text;
+    courseId : Text;
+    courseName : Text;
+    email : Text;
+    examCenter : Text;
+    examDate : Text;
+    hallTicketNo : Text;
+    id : Text;
+    rollNo : Text;
+    seatingPosition : Text;
+    studentId : Text;
+    timeSlot : Text;
+    yearKey : Text
+  };
+type FileSnapshot__1026474522 =
+  {
+    filename : Text;
+    id : Text;
+    isActive : Bool;
+    recordCount : Nat;
+    timestamp : Int
+  };
+type HODPermission__163414190 =
+  {
+    branch : Text;
+    college : Text;
+    editCredits : Nat;
+    uploadCredits : Nat;
+    yearKey : Text
+  };
+type Internal__8484328<K, V> =
+  {children : [var ?Node__46230540<K, V>]; data : Data__791452850<K, V>};
+type Leaf__809889148<K, V> = {data : Data__791452850<K, V>};
+type List__415060402<T> = List__790383201<T>;
+type List__790383201<T> =
+  {
+    var blockIndex : Nat__490723111;
+    var blocks : [var [var ?T]];
+    var elementIndex : Nat__490723111
+  };
+type Nat__490723111 = Nat__920180692;
+type Nat__920180692 = Nat;
+type Node__46230540<K, V> =
+  {#internal : Internal__8484328<K, V>; #leaf : Leaf__809889148<K, V>};
+type OverviewStats__652734519 =
+  {
+    cleanEnrollment : Nat;
+    enrollmentErrors : Nat;
+    examRegDoFirst : Nat;
+    examRegDone : Nat;
+    examRegErrors : Nat;
+    examRegRedo : Nat;
+    totalEnrolled : Nat;
+    totalRegistered : Nat
+  };
+actor {
+  stable branchStatsCache :
+    {
+      var root : Node__46230540<Text, BranchStats__130335619>;
+      var size : Nat__490723111
+    };
+  stable courseMap :
+    {
+      var root : Node__46230540<Text, CourseRecord__245956781>;
+      var size : Nat__490723111
+    };
+  stable editedRecordsList :
+    {
+      var blockIndex : Nat__490723111;
+      var blocks : [var [var ?EditedRecord__389897775]];
+      var elementIndex : Nat__490723111
+    };
+  stable enrollmentMap :
+    {
+      var root : Node__46230540<Text, EnrollmentRecord__975602187>;
+      var size : Nat__490723111
+    };
+  stable examRegMap :
+    {
+      var root : Node__46230540<Text, ExamRegRecord__262967610>;
+      var size : Nat__490723111
+    };
+  stable examShuffleMap :
+    {
+      var root : Node__46230540<Text, ExamShuffleRecord__95838409>;
+      var size : Nat__490723111
+    };
+  stable fileSnapshotMap :
+    {
+      var root :
+        Node__46230540<Text, List__415060402<FileSnapshot__1026474522>>;
+      var size : Nat__490723111
+    };
+  stable hodPermissionsMap :
+    {
+      var root : Node__46230540<Text, HODPermission__163414190>;
+      var size : Nat__490723111
+    };
+  stable overviewStatsCache :
+    {
+      var root : Node__46230540<Text, OverviewStats__652734519>;
+      var size : Nat__490723111
+    }
+};

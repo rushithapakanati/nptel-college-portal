@@ -59,7 +59,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { motion } from "motion/react";
-import { useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -81,12 +81,12 @@ import {
   type EnrollmentError,
   type ExamRegError,
   type HodPermission,
+  type StudentUploadRecord,
 } from "../data/mockData";
 import {
   type CrossMatchError,
   crossMatchEnrollmentExamReg,
   getFileHeaders,
-  loadXLSXLib,
   parseCourseRows,
   parseExamRegRecords,
   parseExamShuffleRows,
@@ -95,28 +95,59 @@ import {
   validateExamRegRows,
 } from "../utils/fileParser";
 
+// ─── Snapshot type (used by file versioning) ──────────────────────────────────
+interface LocalSnapshot {
+  fileName: string;
+  timestamp: number;
+  records: StudentUploadRecord[];
+  errors: EnrollmentError[] | ExamRegError[];
+}
+
 const PIE_COLORS = ["#4f46e5", "#f59e0b", "#ef4444"];
 
-async function downloadErrorsAsExcel<
-  T extends {
-    studentId: string;
-    email: string;
-    courseId: string;
-    courseName?: string;
-    errorType: string;
-    details?: string;
-  },
->(errors: T[], filename: string) {
-  const XLSX = await loadXLSXLib();
-  const rows = errors.map((e) => ({
+// ─── Excel download helper ─────────────────────────────────────────────────────
+async function downloadErrorsAsExcel(
+  errors: (EnrollmentError | ExamRegError)[],
+  filename: string,
+) {
+  // Dynamically load XLSX from window (loaded via CDN in index.html) or fallback to CSV
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const XLSX = (window as any).XLSX;
+  if (!XLSX) {
+    // Fallback: download as CSV
+    const header =
+      "Student ID,Email,Course ID,Course Name,Error Type,Description,Branch";
+    const rows = errors.map((e) =>
+      [
+        `"${e.studentId}"`,
+        `"${e.email}"`,
+        `"${e.courseId}"`,
+        `"${(e.courseName || "").replace(/"/g, '""')}"`,
+        `"${e.errorType}"`,
+        `"${(e.description || "").replace(/"/g, '""')}"`,
+        `"${e.branch}"`,
+      ].join(","),
+    );
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename.replace(".xlsx", ".csv");
+    a.click();
+    URL.revokeObjectURL(url);
+    return;
+  }
+  const rowData = errors.map((e) => ({
     "Student ID": e.studentId,
     Email: e.email,
     "Course ID": e.courseId,
     "Course Name": e.courseName || "",
     "Error Type": e.errorType,
-    Description: e.details || "",
+    Description: e.description || "",
+    Branch: e.branch,
   }));
-  const ws = XLSX.utils.json_to_sheet(rows);
+  const ws = XLSX.utils.json_to_sheet(rowData);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Errors");
   XLSX.writeFile(wb, filename);
@@ -124,24 +155,218 @@ async function downloadErrorsAsExcel<
 
 function classifyPaymentStatus(status?: string): "done" | "redo" | "doFirst" {
   if (!status) return "doFirst";
-  // Normalize underscores to spaces so "payment_failed" matches "payment failed"
-  const s = status.toLowerCase().replace(/_/g, " ").trim();
+  const s = status.toLowerCase().replace(/[_\s]/g, "").trim();
   if (
-    s === "payment failed" ||
-    s === "failed" ||
-    s === "payment complete" ||
-    s === "complete"
-  )
-    return "done";
+    s === "paymentcomplete" ||
+    s === "complete" ||
+    s === "paymentsuccess" ||
+    s === "success" ||
+    s === "paymentfailed" ||
+    s === "failed"
+  ) {
+    if (
+      s === "paymentcomplete" ||
+      s === "complete" ||
+      s === "paymentsuccess" ||
+      s === "success"
+    )
+      return "done";
+    return "redo";
+  }
   if (
-    s === "payment pending" ||
+    s === "paymentpending" ||
     s === "pending" ||
-    s === "payment draft" ||
+    s === "paymentdraft" ||
     s === "draft"
   )
     return "redo";
   return "doFirst";
 }
+
+function getErrorBadgeClass(errorType: string): string {
+  const t = errorType.toLowerCase();
+  if (t.includes("missing")) return "bg-red-100 text-red-700 border-red-300";
+  if (t.includes("invalid") || t.includes("format"))
+    return "bg-orange-100 text-orange-700 border-orange-300";
+  if (t.includes("mismatch") || t.includes("cross"))
+    return "bg-yellow-100 text-yellow-700 border-yellow-300";
+  if (t.includes("payment") || t.includes("redo"))
+    return "bg-amber-100 text-amber-700 border-amber-300";
+  return "bg-destructive/10 text-destructive border-destructive/30";
+}
+
+// ─── Reusable paginated error table ───────────────────────────────────────────
+
+interface ErrorTableProps {
+  errors: (EnrollmentError | ExamRegError)[];
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  onPrev: () => void;
+  onNext: () => void;
+  theme: "blue" | "purple" | "default";
+  showPaymentStatus?: boolean;
+  onView: (err: EnrollmentError | ExamRegError) => void;
+  ocidPrefix: string;
+}
+
+function ErrorTable({
+  errors,
+  page,
+  pageSize,
+  totalPages,
+  onPrev,
+  onNext,
+  theme,
+  showPaymentStatus,
+  onView,
+  ocidPrefix,
+}: ErrorTableProps) {
+  const themeClass =
+    theme === "blue"
+      ? "bg-blue-50/60"
+      : theme === "purple"
+        ? "bg-purple-50/60"
+        : "bg-muted/50";
+  const headClass =
+    theme === "blue"
+      ? "text-blue-700"
+      : theme === "purple"
+        ? "text-purple-700"
+        : "";
+
+  if (errors.length === 0) {
+    return (
+      <div className="text-center py-12 text-muted-foreground">
+        <CheckCircle2 className="h-10 w-10 mx-auto mb-2 text-green-400" />
+        <p>No errors found for selected filters.</p>
+      </div>
+    );
+  }
+
+  const start = (page - 1) * pageSize + 1;
+  const end = Math.min(page * pageSize, errors.length);
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground px-1">
+        Showing {start}–{end} of{" "}
+        <strong className="text-foreground">{errors.length}</strong> errors
+      </p>
+      <div
+        className="rounded-lg border overflow-x-auto"
+        data-ocid={`${ocidPrefix}.table`}
+      >
+        <Table>
+          <TableHeader>
+            <TableRow className={themeClass}>
+              <TableHead className={headClass}>#</TableHead>
+              <TableHead className={headClass}>Branch</TableHead>
+              <TableHead className={headClass}>Roll No</TableHead>
+              <TableHead className={headClass}>Email</TableHead>
+              <TableHead className={headClass}>Course Name</TableHead>
+              <TableHead className={headClass}>Course ID</TableHead>
+              {showPaymentStatus && (
+                <TableHead className={headClass}>Payment Status</TableHead>
+              )}
+              <TableHead className={headClass}>Error Type</TableHead>
+              <TableHead className={headClass}>Details</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {errors.map((err, i) => (
+              <TableRow
+                key={`${err.id}-${i}`}
+                data-ocid={`${ocidPrefix}.row.${i + 1}`}
+              >
+                <TableCell className="text-muted-foreground text-xs">
+                  {(page - 1) * pageSize + i + 1}
+                </TableCell>
+                <TableCell>
+                  <Badge variant="secondary" className="text-xs">
+                    {err.branch}
+                  </Badge>
+                </TableCell>
+                <TableCell className="font-mono text-sm">
+                  {err.studentId}
+                </TableCell>
+                <TableCell className="text-sm max-w-[160px] truncate">
+                  {err.email}
+                </TableCell>
+                <TableCell className="text-sm max-w-xs">
+                  <span className="font-semibold text-primary truncate block">
+                    {err.courseName || "-"}
+                  </span>
+                </TableCell>
+                <TableCell className="font-mono text-sm">
+                  {err.courseId}
+                </TableCell>
+                {showPaymentStatus && (
+                  <TableCell>
+                    <Badge
+                      variant="outline"
+                      className="text-xs border-amber-400 text-amber-700 bg-amber-50"
+                    >
+                      {"paymentStatus" in err
+                        ? (err as ExamRegError).paymentStatus || "N/A"
+                        : "N/A"}
+                    </Badge>
+                  </TableCell>
+                )}
+                <TableCell>
+                  <Badge
+                    variant="outline"
+                    className={`text-xs ${getErrorBadgeClass(err.errorType)}`}
+                  >
+                    {err.errorType}
+                  </Badge>
+                </TableCell>
+                <TableCell>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => onView(err)}
+                    className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
+                    data-ocid={`${ocidPrefix}.view_button`}
+                  >
+                    <Eye className="h-3 w-3" /> View
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between pt-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onPrev}
+            disabled={page === 1}
+            data-ocid={`${ocidPrefix}.pagination_prev`}
+          >
+            Previous
+          </Button>
+          <span className="text-sm text-muted-foreground">
+            Page {page} of {totalPages}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onNext}
+            disabled={page === totalPages}
+            data-ocid={`${ocidPrefix}.pagination_next`}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Main component ────────────────────────────────────────────────────────────
 
 export default function DeanDashboard() {
   const navigate = useNavigate();
@@ -159,6 +384,8 @@ export default function DeanDashboard() {
     setExamRegErrors,
     uploadedStudentRecords,
     setUploadedStudentRecords,
+    uploadedExamRegRecords,
+    setUploadedExamRegRecords,
     uploadedCourses,
     setUploadedCourses,
     deanStudentDataUploaded,
@@ -171,104 +398,126 @@ export default function DeanDashboard() {
     setDeanCourseFileUploaded,
     deanExamRegDataUploaded,
     setDeanExamRegDataUploaded,
-    deanShuffleDataUploaded: _deanShuffleDataUploaded,
     setDeanShuffleDataUploaded,
     uploadedShuffleRecords,
     setUploadedShuffleRecords,
     hodEditedRecords,
+    enrollmentFileRecordCount,
+    examRegFileRecordCount,
     logout,
   } = useAppContext();
 
-  // ── local perm edit state per branch ──
-  const [viewErrorDeanDialog, setViewErrorDeanDialog] = useState<{
-    details: string;
+  // ── Dialog state ──
+  const [viewErrorDialog, setViewErrorDialog] = useState<{
+    description: string;
     courseName?: string;
     courseId?: string;
     errorType?: string;
     studentId?: string;
+    email?: string;
+    branch?: string;
   } | null>(null);
+
+  // ── Parsing state ──
+  const [parsingFile, setParsingFile] = useState<string | null>(null);
+
+  // ── Permissions pending state ──
   const [pendingPerms, setPendingPerms] = useState<
     Record<Branch, HodPermission>
   >(
     JSON.parse(JSON.stringify(hodPermissions)) as Record<Branch, HodPermission>,
   );
 
-  // ── Upload state ──
+  // ── Upload refs ──
   const courseFileRef = useRef<HTMLInputElement>(null);
   const studentDataFileRef = useRef<HTMLInputElement>(null);
   const examRegFileRef = useRef<HTMLInputElement>(null);
   const shuffleFileRef = useRef<HTMLInputElement>(null);
+
+  // ── File name lists ──
   const [courseFileName, setCourseFileName] = useState<string | null>(null);
-  // Multiple file support for enrollment and exam reg
   const [enrollmentFileNames, setEnrollmentFileNames] = useState<string[]>([]);
   const [examRegFileNames, setExamRegFileNames] = useState<string[]>([]);
   const [shuffleFileNames, setShuffleFileNames] = useState<string[]>([]);
-
-  // ── Detected headers (for debug display) ──
   const [courseFileHeaders, setCourseFileHeaders] = useState<string[]>([]);
   const [enrollmentFileHeaders, setEnrollmentFileHeaders] = useState<string[]>(
     [],
   );
-  const [_examRegFileHeaders, setExamRegFileHeaders] = useState<string[]>([]);
 
-  // ── Filter state ──
-  const [courseBranchFilter, setCourseBranchFilter] = useState<string>("All");
-  const [errorBranchFilter, setErrorBranchFilter] = useState<string>("All");
-  const [errorTypeFilter, setErrorTypeFilter] = useState<string>("All");
-
-  // ── Enrollment errors tab filters ──
-  const [enrollErrBranchFilter, setEnrollErrBranchFilter] =
-    useState<string>("All");
-  const [enrollErrTypeFilter, setEnrollErrTypeFilter] = useState<string>("All");
-  const [enrollErrPage, setEnrollErrPage] = useState(1);
-
-  // ── Exam reg errors tab filters ──
-  const [examErrBranchFilter, setExamErrBranchFilter] = useState<string>("All");
-  const [examErrTypeFilter, setExamErrTypeFilter] = useState<string>("All");
-  const [examErrPage, setExamErrPage] = useState(1);
-
-  const ERRORS_PAGE_SIZE = 100;
-
-  // ── Error table pagination ──
-  const ERROR_PAGE_SIZE = 100;
-  const [errorPage, setErrorPage] = useState(1);
-
-  // ── Course table pagination ──
-  const COURSE_PAGE_SIZE = 50;
-  const [coursePage, setCoursePage] = useState(1);
-
-  // ── Enrollment/Exam Reg record counts (tracked separately) ──
-  const [enrollmentRecordCount, setEnrollmentRecordCount] = useState(0);
+  // ── Per-branch enrollment counts (from upload) ──
   const [enrollBranchCounts, setEnrollBranchCounts] = useState<
     Record<string, number>
   >({});
-  const [_examRegRecordCount, setExamRegRecordCount] = useState(0);
+
   // ── Cross-match errors ──
   const [crossMatchErrors, setCrossMatchErrors] = useState<CrossMatchError[]>(
     [],
   );
-  // ── Snapshot selection (for viewing previous file data) ──
+
+  // ── Snapshot selection ──
   const [selectedEnrollmentSnapshotIdx, setSelectedEnrollmentSnapshotIdx] =
     useState<number | null>(null);
   const [selectedExamRegSnapshotIdx, setSelectedExamRegSnapshotIdx] = useState<
     number | null
   >(null);
-  // ── Refresh state ──
-  const [_refreshKey, setRefreshKey] = useState(0);
+
+  // ── Filter state ──
+  const [errorBranchFilter, setErrorBranchFilter] = useState<string>("All");
+  const [errorTypeFilter, setErrorTypeFilter] = useState<string>("All");
+  const [errorPage, setErrorPage] = useState(1);
+
+  const [enrollErrBranchFilter, setEnrollErrBranchFilter] =
+    useState<string>("All");
+  const [enrollErrTypeFilter, setEnrollErrTypeFilter] = useState<string>("All");
+  const [enrollErrPage, setEnrollErrPage] = useState(1);
+
+  const [examErrBranchFilter, setExamErrBranchFilter] = useState<string>("All");
+  const [examErrTypeFilter, setExamErrTypeFilter] = useState<string>("All");
+  const [examErrPage, setExamErrPage] = useState(1);
+
+  const [coursePage, setCoursePage] = useState(1);
+
+  const [donePage, setDonePage] = useState(1);
+  const [hodEditPage, setHodEditPage] = useState(1);
+
+  // ── Done Registrations branch filter ──
+  const [doneBranchFilter, setDoneBranchFilter] = useState<string>("All");
+
+  const PAGE_SIZE = 50;
+  const COURSE_PAGE_SIZE = 50;
+  const DONE_PAGE_SIZE = 50;
+  const HOD_EDIT_PAGE_SIZE = 50;
+
+  // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+  const handleLogout = useCallback(() => {
+    logout();
+    navigate({ to: "/" });
+  }, [logout, navigate]);
+
   function handleRefresh() {
-    setRefreshKey((k) => k + 1);
     toast.success("Dashboard data refreshed.");
   }
 
-  function handleLogout() {
-    logout();
-    navigate({ to: "/" });
-  }
+  const savePerms = useCallback(
+    (branch: Branch) => {
+      updateHodPermission(branch, pendingPerms[branch]);
+      toast.success(`Permissions saved for ${branch} HOD.`);
+    },
+    [updateHodPermission, pendingPerms],
+  );
 
-  function savePerms(branch: Branch) {
-    updateHodPermission(branch, pendingPerms[branch]);
-    toast.success(`Permissions saved for ${branch} HOD.`);
-  }
+  const openErrorDialog = useCallback((err: EnrollmentError | ExamRegError) => {
+    setViewErrorDialog({
+      description: err.description,
+      courseName: err.courseName,
+      courseId: err.courseId,
+      errorType: err.errorType,
+      studentId: err.studentId,
+      email: err.email,
+      branch: err.branch,
+    });
+  }, []);
 
   async function handleCourseUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -279,23 +528,19 @@ export default function DeanDashboard() {
       const rows = await parseUploadedFile(file);
       const headers = getFileHeaders(rows);
       setCourseFileHeaders(headers);
-      console.log("[Course File] Detected headers:", headers);
-      console.log("[Course File] Sample row:", rows[0]);
       const courses = parseCourseRows(rows);
       setUploadedCourses(courses);
       setDeanCourseFileUploaded(true);
-      toast.success(
-        `Course file "${file.name}" uploaded. ${courses.length} 12-week courses loaded from ${rows.length} total rows.`,
-      );
+      toast.success(`Course file loaded — ${courses.length} 12-week courses.`);
       if (courses.length === 0 && rows.length > 0) {
         toast.warning(
-          `No 12-week courses found. Detected columns: ${headers.join(", ")}. Check that your file has a Duration/Weeks column with value "12".`,
+          `No 12-week courses found. Detected columns: ${headers.join(", ")}`,
           { duration: 8000 },
         );
       }
     } catch (err) {
       toast.error(
-        `Failed to parse course file: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to parse: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -305,17 +550,13 @@ export default function DeanDashboard() {
   ) {
     const file = e.target.files?.[0];
     if (!file) return;
-    // Reset the input so same file can be re-uploaded
     e.target.value = "";
+    setParsingFile(file.name);
     try {
-      toast.info(
-        `Parsing student data file "${file.name}"... This may take a moment for large files.`,
-      );
+      toast.info(`Parsing enrollment file "${file.name}"...`);
       const rows = await parseUploadedFile(file);
       const headers = getFileHeaders(rows);
       setEnrollmentFileHeaders(headers);
-      console.log("[Enrollment File] Detected headers:", headers);
-      console.log("[Enrollment File] Sample row:", rows[0]);
       const uploadedCourseIds = uploadedCourses.map((c) => c.courseId);
       const { records, errors } = validateEnrollmentRows(
         rows,
@@ -323,39 +564,33 @@ export default function DeanDashboard() {
         uploadedCourseIds,
         uploadedCourses,
       );
-      setUploadedStudentRecords(records);
+      setUploadedStudentRecords(records, records.length);
       setEnrollmentErrors(errors);
       setDeanStudentDataUploaded(true);
       setEnrollmentFileNames((prev) => [...prev, file.name]);
-      setEnrollmentRecordCount(records.length);
-      // Build per-branch enrollment counts from this file only
       const branchCountMap: Record<string, number> = {};
       for (const r of records) {
-        if (r.profession?.toLowerCase() === "faculty") continue;
         branchCountMap[r.branch] = (branchCountMap[r.branch] ?? 0) + 1;
       }
       setEnrollBranchCounts(branchCountMap);
-      // Save snapshot for versioning
       addEnrollmentSnapshot({
+        id: `snap-${Date.now()}`,
         fileName: file.name,
-        records,
-        errors,
-        timestamp: Date.now(),
+        uploadedAt: new Date().toISOString(),
+        recordCount: records.length,
+        isActive: true,
+        data: records,
       });
-      setSelectedEnrollmentSnapshotIdx(null); // show latest
+      setSelectedEnrollmentSnapshotIdx(null);
       toast.success(
-        `Student data "${file.name}" parsed: ${records.length} student records, ${errors.length} errors found.`,
+        `"${file.name}" — ${records.length} records, ${errors.length} errors.`,
       );
-      if (errors.length === 0 && records.length > 0) {
-        toast.info(
-          `All ${records.length} records passed validation. Detected columns: ${headers.slice(0, 6).join(", ")}${headers.length > 6 ? "..." : ""}`,
-          { duration: 6000 },
-        );
-      }
     } catch (err) {
       toast.error(
-        `Failed to parse student file: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to parse: ${err instanceof Error ? err.message : String(err)}`,
       );
+    } finally {
+      setParsingFile(null);
     }
   }
 
@@ -372,15 +607,10 @@ export default function DeanDashboard() {
   async function handleExamRegUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    // Reset the input so same file can be re-uploaded
     e.target.value = "";
     try {
       toast.info(`Parsing exam registration file "${file.name}"...`);
       const rows = await parseUploadedFile(file);
-      const headers = getFileHeaders(rows);
-      setExamRegFileHeaders(headers);
-      console.log("[Exam Reg File] Detected headers:", headers);
-      console.log("[Exam Reg File] Sample row:", rows[0]);
       const enrollmentIds = uploadedStudentRecords.map((r) => r.studentId);
       const courseIdsForValidation = uploadedCourses.map((c) => c.courseId);
       const examErrors = validateExamRegRows(
@@ -390,39 +620,19 @@ export default function DeanDashboard() {
         collegeName,
       );
       const examRecords = parseExamRegRecords(rows);
-      // Merge exam records into uploaded student records for statistics
-      const examMap = new Map(examRecords.map((r) => [r.studentId, r]));
-      const mergedRecords = uploadedStudentRecords
-        .map((r) => {
-          const er = examMap.get(r.studentId);
-          return er
-            ? {
-                ...r,
-                paymentStatus: er.paymentStatus,
-                examCourseId: er.examCourseId,
-              }
-            : r;
-        })
-        .concat(
-          examRecords.filter(
-            (er) =>
-              !uploadedStudentRecords.some((r) => r.studentId === er.studentId),
-          ),
-        );
-      setUploadedStudentRecords(mergedRecords);
+      setUploadedExamRegRecords(examRecords, examRecords.length);
       setExamRegErrors(examErrors);
       setDeanExamRegDataUploaded(true);
       setExamRegFileNames((prev) => [...prev, file.name]);
-      setExamRegRecordCount(examRecords.length);
-      // Save snapshot for versioning
       addExamRegSnapshot({
+        id: `snap-${Date.now()}`,
         fileName: file.name,
-        records: examRecords,
-        errors: examErrors,
-        timestamp: Date.now(),
+        uploadedAt: new Date().toISOString(),
+        recordCount: examRecords.length,
+        isActive: true,
+        data: examRecords,
       });
-      setSelectedExamRegSnapshotIdx(null); // show latest
-      // Run cross-match if both files uploaded
+      setSelectedExamRegSnapshotIdx(null);
       const crossErrors = crossMatchEnrollmentExamReg(
         uploadedStudentRecords,
         examRecords,
@@ -430,11 +640,11 @@ export default function DeanDashboard() {
       );
       setCrossMatchErrors(crossErrors);
       toast.success(
-        `Exam registration "${file.name}" parsed: ${examErrors.length} errors found.`,
+        `"${file.name}" — ${examRecords.length} records, ${examErrors.length} errors.`,
       );
     } catch (err) {
       toast.error(
-        `Failed to parse exam registration file: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to parse: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -445,13 +655,7 @@ export default function DeanDashboard() {
     if (newList.length === 0) {
       setDeanExamRegDataUploaded(false);
       setExamRegErrors([]);
-      // Remove exam reg data from merged records
-      const cleanedRecords = uploadedStudentRecords.map((r) => {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { paymentStatus: _p, examCourseId: _e, ...rest } = r;
-        return rest;
-      });
-      setUploadedStudentRecords(cleanedRecords);
+      setUploadedExamRegRecords([]);
     }
   }
 
@@ -460,26 +664,24 @@ export default function DeanDashboard() {
     if (!file) return;
     e.target.value = "";
     try {
-      toast.info(`Parsing exam shuffle file "${file.name}"...`);
+      toast.info(`Parsing shuffle file "${file.name}"...`);
       const rows = await parseUploadedFile(file);
       const shuffleRecs = parseExamShuffleRows(rows);
-      // Merge with existing shuffle records (replace by studentId+courseId key)
       const existingMap = new Map(
         uploadedShuffleRecords.map((r) => [`${r.studentId}::${r.courseId}`, r]),
       );
       for (const rec of shuffleRecs) {
         existingMap.set(`${rec.studentId}::${rec.courseId}`, rec);
       }
-      const merged = Array.from(existingMap.values());
-      setUploadedShuffleRecords(merged);
+      setUploadedShuffleRecords(Array.from(existingMap.values()));
       setDeanShuffleDataUploaded(true);
       setShuffleFileNames((prev) => [...prev, file.name]);
       toast.success(
-        `Exam shuffle file "${file.name}" uploaded. ${shuffleRecs.length} student shuffle records loaded.`,
+        `"${file.name}" — ${shuffleRecs.length} shuffle records loaded.`,
       );
     } catch (err) {
       toast.error(
-        `Failed to parse shuffle file: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to parse: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
@@ -493,153 +695,217 @@ export default function DeanDashboard() {
     }
   }
 
-  // ── Enrollment branch stats (all uploaded student records = enrollment data) ──
+  // ─── Statistics computations ──────────────────────────────────────────────────
 
-  const enrollBranchStats = BRANCHES.map((b) => ({
-    branch: b,
-    total: enrollBranchCounts[b] ?? 0,
-  }));
+  const enrollBranchStats = useMemo(
+    () =>
+      BRANCHES.map((b) => ({
+        branch: b,
+        total: enrollBranchCounts[b] ?? 0,
+        errors: enrollmentErrors.filter((e) => e.branch === b).length,
+      })),
+    [enrollBranchCounts, enrollmentErrors],
+  );
 
-  // ── Exam reg branch stats (records that have paymentStatus = have exam reg data) ──
-  const examRegBranchStatsMap = new Map<
-    Branch,
-    { done: number; redo: number; doFirst: number }
-  >();
-  for (const b of BRANCHES) {
-    examRegBranchStatsMap.set(b, { done: 0, redo: 0, doFirst: 0 });
-  }
-  for (const r of uploadedStudentRecords.filter(
-    (record) =>
-      record.profession?.toLowerCase() !== "faculty" &&
-      record.paymentStatus !== undefined &&
-      record.paymentStatus !== null &&
-      record.paymentStatus !== "",
-  )) {
-    const stats = examRegBranchStatsMap.get(r.branch);
-    if (!stats) continue;
-    const cls = classifyPaymentStatus(r.paymentStatus);
-    stats[cls]++;
-  }
-  const dynamicBranchStats = BRANCHES.map((b) => ({
-    branch: b,
-    ...(examRegBranchStatsMap.get(b) ?? { done: 0, redo: 0, doFirst: 0 }),
-  }));
+  const examRegBranchStats = useMemo(() => {
+    const statsMap = new Map<
+      Branch,
+      {
+        total: number;
+        done: number;
+        redo: number;
+        doFirst: number;
+        errors: number;
+      }
+    >();
+    for (const b of BRANCHES) {
+      statsMap.set(b, { total: 0, done: 0, redo: 0, doFirst: 0, errors: 0 });
+    }
+    for (const r of uploadedExamRegRecords) {
+      const stats = statsMap.get(r.branch);
+      if (!stats) continue;
+      stats.total++;
+      const cls = classifyPaymentStatus(r.paymentStatus);
+      stats[cls]++;
+    }
+    for (const e of examRegErrors) {
+      const stats = statsMap.get(e.branch);
+      if (stats) stats.errors++;
+    }
+    return BRANCHES.map((b) => ({
+      branch: b,
+      ...(statsMap.get(b) ?? {
+        total: 0,
+        done: 0,
+        redo: 0,
+        doFirst: 0,
+        errors: 0,
+      }),
+    }));
+  }, [uploadedExamRegRecords, examRegErrors]);
 
-  const _totalEnrollStudents = uploadedStudentRecords.filter(
-    (r) => r.profession?.toLowerCase() !== "faculty",
-  ).length;
-  const totalStudents = uploadedStudentRecords.filter(
-    (r) =>
-      r.profession?.toLowerCase() !== "faculty" &&
-      r.paymentStatus !== undefined &&
-      r.paymentStatus !== null &&
-      r.paymentStatus !== "",
-  ).length;
-  // enrollmentErrors.length + examRegErrors.length tracked separately
-  const _branchesWithData = new Set(
-    uploadedStudentRecords
-      .filter((r) => r.profession?.toLowerCase() !== "faculty")
-      .map((r) => r.branch),
-  ).size;
+  const totalDone = useMemo(
+    () => examRegBranchStats.reduce((a, b) => a + b.done, 0),
+    [examRegBranchStats],
+  );
+  const totalRedo = useMemo(
+    () => examRegBranchStats.reduce((a, b) => a + b.redo, 0),
+    [examRegBranchStats],
+  );
+  const totalDoFirst = useMemo(
+    () => examRegBranchStats.reduce((a, b) => a + b.doFirst, 0),
+    [examRegBranchStats],
+  );
 
-  const totalDone = dynamicBranchStats.reduce((a, b) => a + b.done, 0);
-  const totalRedo = dynamicBranchStats.reduce((a, b) => a + b.redo, 0);
-  const totalDoFirst = dynamicBranchStats.reduce((a, b) => a + b.doFirst, 0);
-  const pieData = [
-    { name: "Done", value: totalDone },
-    { name: "Redo Registration", value: totalRedo },
-    { name: "Do First Registration", value: totalDoFirst },
-  ];
+  const pieData = useMemo(
+    () => [
+      { name: "Done", value: totalDone },
+      { name: "Redo Registration", value: totalRedo },
+      { name: "Do First Registration", value: totalDoFirst },
+    ],
+    [totalDone, totalRedo, totalDoFirst],
+  );
 
-  // ── Courses: use uploadedCourses if available, else empty ──
+  // ─── Done registrations ───────────────────────────────────────────────────────
+
+  const doneRegistrations = useMemo(
+    () =>
+      uploadedExamRegRecords.filter(
+        (r) => classifyPaymentStatus(r.paymentStatus) === "done",
+      ),
+    [uploadedExamRegRecords],
+  );
+
+  const filteredDoneRegs = useMemo(
+    () =>
+      doneBranchFilter === "All"
+        ? doneRegistrations
+        : doneRegistrations.filter((r) => r.branch === doneBranchFilter),
+    [doneRegistrations, doneBranchFilter],
+  );
+
+  const pagedDoneRegs = useMemo(
+    () =>
+      filteredDoneRegs.slice(
+        (donePage - 1) * DONE_PAGE_SIZE,
+        donePage * DONE_PAGE_SIZE,
+      ),
+    [filteredDoneRegs, donePage],
+  );
+  const totalDonePages = Math.ceil(filteredDoneRegs.length / DONE_PAGE_SIZE);
+
+  // ─── Courses ──────────────────────────────────────────────────────────────────
+
   const displayCourses = deanCourseFileUploaded ? uploadedCourses : [];
-  const filteredCourses =
-    courseBranchFilter === "All"
-      ? displayCourses
-      : displayCourses.filter((c) => c.branch === courseBranchFilter);
+  const filteredCourses = useMemo(() => displayCourses, [displayCourses]);
+  const pagedCourses = useMemo(
+    () =>
+      filteredCourses.slice(
+        (coursePage - 1) * COURSE_PAGE_SIZE,
+        coursePage * COURSE_PAGE_SIZE,
+      ),
+    [filteredCourses, coursePage],
+  );
+  const totalCoursePages = Math.ceil(filteredCourses.length / COURSE_PAGE_SIZE);
 
-  // ── Combined errors ──
-  const allErrors = [
-    ...enrollmentErrors.map((e) => ({
-      ...e,
-      type: "Enrollment",
-      paymentStatus: "-",
-      classification: "-",
-    })),
-    ...examRegErrors.map((e) => ({
-      ...e,
-      type: "Exam Reg",
-      details: e.details ?? "-",
-    })),
-  ];
-  const filteredErrors = allErrors.filter((e) => {
-    const branchMatch =
-      errorBranchFilter === "All" || e.branch === errorBranchFilter;
-    const typeMatch =
-      errorTypeFilter === "All" || e.errorType === errorTypeFilter;
-    return branchMatch && typeMatch;
-  });
+  // ─── All errors (combined) ────────────────────────────────────────────────────
 
-  const uniqueErrorTypes = Array.from(
-    new Set(allErrors.map((e) => e.errorType)),
+  const allCombinedErrors = useMemo(
+    () => [
+      ...enrollmentErrors.map((e) => ({
+        ...e,
+        _source: "Enrollment" as const,
+      })),
+      ...examRegErrors.map((e) => ({ ...e, _source: "Exam Reg" as const })),
+    ],
+    [enrollmentErrors, examRegErrors],
   );
 
-  // Paginated slice for display
-  const totalErrorPages = Math.ceil(filteredErrors.length / ERROR_PAGE_SIZE);
-  const pagedErrors = filteredErrors.slice(
-    (errorPage - 1) * ERROR_PAGE_SIZE,
-    errorPage * ERROR_PAGE_SIZE,
+  const filteredAllErrors = useMemo(
+    () =>
+      allCombinedErrors.filter((e) => {
+        const branchMatch =
+          errorBranchFilter === "All" || e.branch === errorBranchFilter;
+        const typeMatch =
+          errorTypeFilter === "All" || e.errorType === errorTypeFilter;
+        return branchMatch && typeMatch;
+      }),
+    [allCombinedErrors, errorBranchFilter, errorTypeFilter],
+  );
+  const uniqueAllErrorTypes = useMemo(
+    () => Array.from(new Set(allCombinedErrors.map((e) => e.errorType))),
+    [allCombinedErrors],
+  );
+  const totalAllErrorPages = Math.ceil(filteredAllErrors.length / PAGE_SIZE);
+  const pagedAllErrors = useMemo(
+    () =>
+      filteredAllErrors.slice(
+        (errorPage - 1) * PAGE_SIZE,
+        errorPage * PAGE_SIZE,
+      ),
+    [filteredAllErrors, errorPage],
   );
 
-  // ── Enrollment errors (separate tab) ──
-  const filteredEnrollErrors = enrollmentErrors.filter((e) => {
-    const branchMatch =
-      enrollErrBranchFilter === "All" || e.branch === enrollErrBranchFilter;
-    const typeMatch =
-      enrollErrTypeFilter === "All" || e.errorType === enrollErrTypeFilter;
-    return branchMatch && typeMatch;
-  });
-  const uniqueEnrollErrTypes = Array.from(
-    new Set(enrollmentErrors.map((e) => e.errorType)),
+  // ─── Enrollment errors filtered ───────────────────────────────────────────────
+
+  const filteredEnrollErrors = useMemo(
+    () =>
+      enrollmentErrors.filter((e) => {
+        const branchMatch =
+          enrollErrBranchFilter === "All" || e.branch === enrollErrBranchFilter;
+        const typeMatch =
+          enrollErrTypeFilter === "All" || e.errorType === enrollErrTypeFilter;
+        return branchMatch && typeMatch;
+      }),
+    [enrollmentErrors, enrollErrBranchFilter, enrollErrTypeFilter],
+  );
+  const uniqueEnrollErrTypes = useMemo(
+    () => Array.from(new Set(enrollmentErrors.map((e) => e.errorType))),
+    [enrollmentErrors],
   );
   const totalEnrollErrPages = Math.ceil(
-    filteredEnrollErrors.length / ERRORS_PAGE_SIZE,
+    filteredEnrollErrors.length / PAGE_SIZE,
   );
-  const pagedEnrollErrors = filteredEnrollErrors.slice(
-    (enrollErrPage - 1) * ERRORS_PAGE_SIZE,
-    enrollErrPage * ERRORS_PAGE_SIZE,
+  const pagedEnrollErrors = useMemo(
+    () =>
+      filteredEnrollErrors.slice(
+        (enrollErrPage - 1) * PAGE_SIZE,
+        enrollErrPage * PAGE_SIZE,
+      ),
+    [filteredEnrollErrors, enrollErrPage],
   );
 
-  // ── Exam reg errors (separate tab) ──
-  const filteredExamRegErrList = examRegErrors.filter((e) => {
-    const branchMatch =
-      examErrBranchFilter === "All" || e.branch === examErrBranchFilter;
-    const typeMatch =
-      examErrTypeFilter === "All" || e.errorType === examErrTypeFilter;
-    return branchMatch && typeMatch;
-  });
-  const uniqueExamErrTypes = Array.from(
-    new Set(examRegErrors.map((e) => e.errorType)),
+  // ─── Exam reg errors filtered ─────────────────────────────────────────────────
+
+  const filteredExamRegErrList = useMemo(
+    () =>
+      examRegErrors.filter((e) => {
+        const branchMatch =
+          examErrBranchFilter === "All" || e.branch === examErrBranchFilter;
+        const typeMatch =
+          examErrTypeFilter === "All" || e.errorType === examErrTypeFilter;
+        return branchMatch && typeMatch;
+      }),
+    [examRegErrors, examErrBranchFilter, examErrTypeFilter],
+  );
+  const uniqueExamErrTypes = useMemo(
+    () => Array.from(new Set(examRegErrors.map((e) => e.errorType))),
+    [examRegErrors],
   );
   const totalExamErrPages = Math.ceil(
-    filteredExamRegErrList.length / ERRORS_PAGE_SIZE,
+    filteredExamRegErrList.length / PAGE_SIZE,
   );
-  const pagedExamErrors = filteredExamRegErrList.slice(
-    (examErrPage - 1) * ERRORS_PAGE_SIZE,
-    examErrPage * ERRORS_PAGE_SIZE,
+  const pagedExamErrors = useMemo(
+    () =>
+      filteredExamRegErrList.slice(
+        (examErrPage - 1) * PAGE_SIZE,
+        examErrPage * PAGE_SIZE,
+      ),
+    [filteredExamRegErrList, examErrPage],
   );
 
-  const noDataUploaded = !deanStudentDataUploaded && !deanExamRegDataUploaded;
+  // ─── HOD edited records ───────────────────────────────────────────────────────
 
-  // ── Done registrations (for the detail table) ──
-  const doneRegistrations = uploadedStudentRecords.filter((r) => {
-    if (r.profession?.toLowerCase() === "faculty") return false;
-    return classifyPaymentStatus(r.paymentStatus) === "done";
-  });
-
-  // ── HOD edited records pagination ──
-  const [hodEditPage, setHodEditPage] = useState(1);
-  const HOD_EDIT_PAGE_SIZE = 50;
   const pagedHodEdits = hodEditedRecords.slice(
     (hodEditPage - 1) * HOD_EDIT_PAGE_SIZE,
     hodEditPage * HOD_EDIT_PAGE_SIZE,
@@ -648,14 +914,279 @@ export default function DeanDashboard() {
     hodEditedRecords.length / HOD_EDIT_PAGE_SIZE,
   );
 
-  // Done registrations pagination
-  const [donePage, setDonePage] = useState(1);
-  const DONE_PAGE_SIZE = 100;
-  const pagedDoneRegs = doneRegistrations.slice(
-    (donePage - 1) * DONE_PAGE_SIZE,
-    donePage * DONE_PAGE_SIZE,
+  const noDataUploaded = !deanStudentDataUploaded && !deanExamRegDataUploaded;
+
+  // ─── Upload card component ────────────────────────────────────────────────────
+
+  function UploadCard({
+    title,
+    description,
+    icon: Icon,
+    iconColor = "text-primary",
+    fileNames,
+    onRemove,
+    inputId,
+    inputRef,
+    onChange,
+    extra,
+    fileOcid,
+    dropzoneOcid,
+    borderColor = "border-primary/40",
+    bgColor = "bg-primary/5",
+    hoverBgColor = "hover:bg-primary/10",
+    isParsing = false,
+  }: {
+    title: string;
+    description: string;
+    icon: React.ElementType;
+    iconColor?: string;
+    fileNames: string[];
+    onRemove: (name: string) => void;
+    inputId: string;
+    inputRef: React.RefObject<HTMLInputElement | null>;
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+    extra?: React.ReactNode;
+    fileOcid: string;
+    dropzoneOcid: string;
+    borderColor?: string;
+    bgColor?: string;
+    hoverBgColor?: string;
+    isParsing?: boolean;
+  }) {
+    return (
+      <Card className="flex-1">
+        <CardHeader>
+          <CardTitle className="font-display text-base flex items-center gap-2">
+            <Icon className={`h-4 w-4 ${iconColor}`} />
+            {title}
+          </CardTitle>
+          <CardDescription>{description}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {isParsing && (
+            <div className="flex items-center gap-2 p-3 rounded-lg bg-blue-50 border border-blue-200 text-xs text-blue-700">
+              <div className="h-4 w-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin shrink-0" />
+              Parsing file…
+            </div>
+          )}
+          {fileNames.length > 0 && (
+            <div className="space-y-2">
+              {fileNames.map((fname) => (
+                <div
+                  key={fname}
+                  className="flex items-center gap-3 p-3 rounded-lg bg-green-50 border border-green-200"
+                >
+                  <CheckCircle2 className="h-4 w-4 text-green-600 shrink-0" />
+                  <p className="text-sm font-medium text-green-700 flex-1 truncate min-w-0">
+                    {fname}
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => onRemove(fname)}
+                    className="h-7 w-7 p-0 text-red-500 hover:text-red-700 hover:bg-red-50 shrink-0"
+                    data-ocid={fileOcid}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+          <label
+            htmlFor={inputId}
+            data-ocid={dropzoneOcid}
+            className={`flex items-center gap-3 p-4 rounded-lg border-2 border-dashed ${borderColor} ${bgColor} cursor-pointer ${hoverBgColor} transition-colors`}
+          >
+            <PlusCircle className={`h-6 w-6 ${iconColor} shrink-0`} />
+            <div>
+              <p className="font-medium text-sm">
+                {fileNames.length > 0
+                  ? `Upload another ${title.toLowerCase()} file`
+                  : `Click to upload ${title} CSV/Excel`}
+              </p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Multiple uploads supported
+              </p>
+            </div>
+          </label>
+          <input
+            ref={inputRef}
+            id={inputId}
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            className="hidden"
+            onChange={onChange}
+          />
+          {extra}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // ─── Snapshot selector helper ─────────────────────────────────────────────────
+
+  function SnapshotSelector({
+    snapshots,
+    selectedIdx,
+    onSelect,
+    onRestore,
+    label,
+  }: {
+    snapshots: LocalSnapshot[];
+    selectedIdx: number | null;
+    onSelect: (idx: number | null) => void;
+    onRestore: (snap: LocalSnapshot) => void;
+    label: string;
+  }) {
+    if (snapshots.length === 0) return null;
+    return (
+      <div className="mt-4 p-3 rounded-lg border bg-muted/30">
+        <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1">
+          <FileText className="h-3.5 w-3.5" /> Previous {label} Files
+        </p>
+        <div className="space-y-1">
+          <button
+            type="button"
+            onClick={() => onSelect(null)}
+            className={`w-full flex items-center justify-between p-2 rounded text-xs ${selectedIdx === null ? "bg-primary/10 border border-primary/30 font-medium" : "hover:bg-muted/50"}`}
+          >
+            <span>Latest (current)</span>
+            <Badge variant="outline" className="text-xs">
+              Active
+            </Badge>
+          </button>
+          {snapshots.map((snap, idx) => (
+            <div
+              key={snap.timestamp}
+              className={`w-full flex items-center justify-between p-2 rounded text-xs ${selectedIdx === idx ? "bg-amber-50 border border-amber-300 font-medium" : "hover:bg-muted/50"}`}
+            >
+              <button
+                type="button"
+                onClick={() => onSelect(idx)}
+                className="flex items-center gap-1 flex-1 truncate text-left cursor-pointer min-w-0"
+              >
+                <span className="truncate flex-1">{snap.fileName}</span>
+                <span className="text-muted-foreground ml-2 shrink-0">
+                  {new Date(snap.timestamp).toLocaleDateString()}
+                </span>
+              </button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 px-2 text-xs ml-2 shrink-0 border-blue-300 text-blue-600 hover:bg-blue-50"
+                onClick={() => {
+                  onRestore(snap);
+                  onSelect(null);
+                }}
+              >
+                Restore
+              </Button>
+            </div>
+          ))}
+        </div>
+        {selectedIdx !== null && (
+          <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800">
+            ⚠️ Viewing historical data from{" "}
+            <strong>{snapshots[selectedIdx]?.fileName}</strong>. This is not the
+            current active data.
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ─── Filter bar helper ────────────────────────────────────────────────────────
+
+  function ErrorFilterBar({
+    branchFilter,
+    onBranchChange,
+    typeFilter,
+    onTypeChange,
+    errorTypes,
+    errors,
+    filename,
+    branchOcid,
+    typeOcid,
+    downloadOcid,
+  }: {
+    branchFilter: string;
+    onBranchChange: (v: string) => void;
+    typeFilter: string;
+    onTypeChange: (v: string) => void;
+    errorTypes: string[];
+    errors: (EnrollmentError | ExamRegError)[];
+    filename: string;
+    branchOcid: string;
+    typeOcid: string;
+    downloadOcid: string;
+  }) {
+    return (
+      <div className="flex items-center gap-2 flex-wrap">
+        <Filter className="h-4 w-4 text-muted-foreground" />
+        <Select value={branchFilter} onValueChange={onBranchChange}>
+          <SelectTrigger className="w-32 h-8" data-ocid={branchOcid}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="All">All Branches</SelectItem>
+            {BRANCHES.map((b) => (
+              <SelectItem key={b} value={b}>
+                {b}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={typeFilter} onValueChange={onTypeChange}>
+          <SelectTrigger className="w-44 h-8" data-ocid={typeOcid}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="All">All Error Types</SelectItem>
+            {errorTypes.map((t) => (
+              <SelectItem key={t} value={t}>
+                {t}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 gap-1 text-xs"
+          data-ocid={downloadOcid}
+          onClick={() => downloadErrorsAsExcel(errors, filename)}
+        >
+          <Download className="h-3 w-3" /> Download
+        </Button>
+      </div>
+    );
+  }
+
+  // ─── Local snapshot lists (derived from context snapshots) ────────────────────
+  const enrollLocalSnapshots: LocalSnapshot[] = useMemo(
+    () =>
+      enrollmentFileSnapshots.map((s) => ({
+        fileName: s.fileName,
+        timestamp: new Date(s.uploadedAt).getTime(),
+        records: s.data as StudentUploadRecord[],
+        errors: [] as EnrollmentError[],
+      })),
+    [enrollmentFileSnapshots],
   );
-  const totalDonePages = Math.ceil(doneRegistrations.length / DONE_PAGE_SIZE);
+
+  const examRegLocalSnapshots: LocalSnapshot[] = useMemo(
+    () =>
+      examRegFileSnapshots.map((s) => ({
+        fileName: s.fileName,
+        timestamp: new Date(s.uploadedAt).getTime(),
+        records: s.data as StudentUploadRecord[],
+        errors: [] as ExamRegError[],
+      })),
+    [examRegFileSnapshots],
+  );
+
+  // ─── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen flex flex-col bg-background">
@@ -683,6 +1214,16 @@ export default function DeanDashboard() {
             <Badge className="bg-white/20 text-white border-white/30 hidden sm:flex">
               {collegeName}
             </Badge>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleRefresh}
+              className="text-white hover:bg-white/20 gap-2"
+              data-ocid="dean.refresh.button"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -734,11 +1275,19 @@ export default function DeanDashboard() {
                 <BookOpen className="h-4 w-4" /> Courses
               </TabsTrigger>
               <TabsTrigger
-                value="statistics"
-                data-ocid="dean.statistics.tab"
+                value="all-errors"
+                data-ocid="dean.all_errors.tab"
                 className="gap-1.5"
               >
-                <BarChart3 className="h-4 w-4" /> Statistics
+                <AlertCircle className="h-4 w-4" /> All Errors
+                {allCombinedErrors.length > 0 && (
+                  <Badge
+                    variant="destructive"
+                    className="ml-1 text-xs px-1.5 py-0 h-4"
+                  >
+                    {allCombinedErrors.length}
+                  </Badge>
+                )}
               </TabsTrigger>
               <TabsTrigger
                 value="enrollment-errors"
@@ -770,6 +1319,13 @@ export default function DeanDashboard() {
                   </Badge>
                 )}
               </TabsTrigger>
+              <TabsTrigger
+                value="statistics"
+                data-ocid="dean.statistics.tab"
+                className="gap-1.5"
+              >
+                <BarChart3 className="h-4 w-4" /> Statistics
+              </TabsTrigger>
             </TabsList>
 
             {/* ── Overview ── */}
@@ -791,75 +1347,77 @@ export default function DeanDashboard() {
                   </div>
                 </div>
               ) : (
-                <>
+                <div className="space-y-6">
                   {/* Enrollment Overview */}
-                  <div className="mb-6">
-                    <p className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wide">
+                  <div>
+                    <p className="text-sm font-semibold text-blue-700 mb-3 uppercase tracking-wide">
                       Enrollment Overview
                     </p>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                      <Card className="bg-blue-50">
-                        <CardContent className="pt-4 pb-4">
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <p className="text-xs text-muted-foreground">
-                                Total Enrolled
-                              </p>
-                              <p className="text-2xl font-display font-bold mt-0.5">
-                                {enrollmentRecordCount}
-                              </p>
-                            </div>
-                            <BookOpen className="h-8 w-8 text-blue-400 opacity-70" />
-                          </div>
-                        </CardContent>
-                      </Card>
-                      <Card className="bg-red-50">
-                        <CardContent className="pt-4 pb-4">
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <p className="text-xs text-muted-foreground">
-                                Enrollment Errors
-                              </p>
-                              <p className="text-2xl font-display font-bold mt-0.5">
-                                {enrollmentErrors.length}
-                              </p>
-                            </div>
-                            <AlertCircle className="h-8 w-8 text-red-400 opacity-70" />
-                          </div>
-                        </CardContent>
-                      </Card>
-                      <Card className="bg-slate-50">
-                        <CardContent className="pt-4 pb-4">
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <p className="text-xs text-muted-foreground">
-                                Clean Records
-                              </p>
-                              <p className="text-2xl font-display font-bold mt-0.5">
-                                {Math.max(
-                                  0,
-                                  enrollmentRecordCount -
-                                    enrollmentErrors.length,
-                                )}
-                              </p>
-                            </div>
-                            <CheckCircle2 className="h-8 w-8 text-green-400 opacity-70" />
-                          </div>
-                        </CardContent>
-                      </Card>
+                      {[
+                        {
+                          label: "Total Enrolled",
+                          value: enrollmentFileRecordCount,
+                          icon: BookOpen,
+                          bg: "bg-blue-50",
+                          iconColor: "text-blue-400",
+                        },
+                        {
+                          label: "Enrollment Errors",
+                          value: enrollmentErrors.length,
+                          icon: AlertCircle,
+                          bg: "bg-red-50",
+                          iconColor: "text-red-400",
+                        },
+                        {
+                          label: "Clean Records",
+                          value: Math.max(
+                            0,
+                            enrollmentFileRecordCount - enrollmentErrors.length,
+                          ),
+                          icon: CheckCircle2,
+                          bg: "bg-green-50",
+                          iconColor: "text-green-400",
+                        },
+                      ].map((stat, i) => {
+                        const Icon = stat.icon;
+                        return (
+                          <Card
+                            key={stat.label}
+                            data-ocid={`dean.overview.enroll.card.${i + 1}`}
+                            className={stat.bg}
+                          >
+                            <CardContent className="pt-4 pb-4">
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <p className="text-xs text-muted-foreground">
+                                    {stat.label}
+                                  </p>
+                                  <p className="text-2xl font-display font-bold mt-0.5">
+                                    {stat.value}
+                                  </p>
+                                </div>
+                                <Icon
+                                  className={`h-8 w-8 ${stat.iconColor} opacity-70`}
+                                />
+                              </div>
+                            </CardContent>
+                          </Card>
+                        );
+                      })}
                     </div>
                   </div>
 
                   {/* Exam Registration Overview */}
-                  <div className="mb-6">
-                    <p className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wide">
+                  <div>
+                    <p className="text-sm font-semibold text-purple-700 mb-3 uppercase tracking-wide">
                       Exam Registration Overview
                     </p>
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                       {[
                         {
                           label: "Total Registered",
-                          value: totalStudents,
+                          value: examRegFileRecordCount,
                           icon: Users,
                           color: "text-purple-600",
                           bg: "bg-purple-50",
@@ -890,7 +1448,7 @@ export default function DeanDashboard() {
                         return (
                           <Card
                             key={stat.label}
-                            data-ocid={`dean.overview.card.${i + 1}`}
+                            data-ocid={`dean.overview.examreg.card.${i + 1}`}
                             className={stat.bg}
                           >
                             <CardContent className="pt-4 pb-4">
@@ -914,579 +1472,260 @@ export default function DeanDashboard() {
                     </div>
                   </div>
 
-                  {/* Per-branch summary */}
-                  <Card>
-                    <CardHeader>
-                      <CardTitle className="font-display text-base">
-                        Branch-wise Overview
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                      <div
-                        className="rounded-lg border overflow-x-auto"
-                        data-ocid="dean.overview.table"
-                      >
-                        <Table>
-                          <TableHeader>
-                            <TableRow className="bg-muted/50">
-                              <TableHead
-                                rowSpan={2}
-                                className="align-middle border-r"
-                              >
-                                Branch
-                              </TableHead>
-                              <TableHead
-                                colSpan={2}
-                                className="text-center text-blue-700 border-r bg-blue-50/50"
-                              >
-                                Enrollment
-                              </TableHead>
-                              <TableHead
-                                colSpan={5}
-                                className="text-center text-purple-700 bg-purple-50/50"
-                              >
-                                Exam Registration
-                              </TableHead>
-                            </TableRow>
-                            <TableRow className="bg-muted/30">
-                              <TableHead className="text-blue-600 text-xs">
-                                Total
-                              </TableHead>
-                              <TableHead className="text-blue-600 text-xs border-r">
-                                Errors
-                              </TableHead>
-                              <TableHead className="text-purple-600 text-xs">
-                                Total
-                              </TableHead>
-                              <TableHead className="text-purple-600 text-xs">
-                                Done
-                              </TableHead>
-                              <TableHead className="text-purple-600 text-xs">
-                                Redo
-                              </TableHead>
-                              <TableHead className="text-purple-600 text-xs">
-                                Do First
-                              </TableHead>
-                              <TableHead className="text-purple-600 text-xs">
-                                Errors
-                              </TableHead>
-                            </TableRow>
-                          </TableHeader>
-                          <TableBody>
-                            {BRANCHES.map((branch, i) => {
-                              const enrollStats = enrollBranchStats.find(
-                                (b) => b.branch === branch,
-                              );
-                              const examStats = dynamicBranchStats.find(
-                                (b) => b.branch === branch,
-                              );
-                              const eErr = enrollmentErrors.filter(
-                                (e) => e.branch === branch,
-                              ).length;
-                              const rErr = examRegErrors.filter(
-                                (e) => e.branch === branch,
-                              ).length;
-                              const examTotal =
-                                (examStats?.done ?? 0) +
-                                (examStats?.redo ?? 0) +
-                                (examStats?.doFirst ?? 0);
-                              return (
-                                <TableRow
-                                  key={branch}
-                                  data-ocid={`dean.overview.row.${i + 1}`}
+                  {/* Branch-wise Overview — only when exam reg uploaded */}
+                  {deanExamRegDataUploaded && (
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="font-display text-base">
+                          Branch-wise Overview
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        <div
+                          className="rounded-lg border overflow-x-auto"
+                          data-ocid="dean.overview.table"
+                        >
+                          <Table>
+                            <TableHeader>
+                              <TableRow className="bg-muted/50">
+                                <TableHead
+                                  rowSpan={2}
+                                  className="align-middle border-r"
                                 >
-                                  <TableCell className="border-r">
-                                    <Badge variant="outline">{branch}</Badge>
-                                  </TableCell>
-                                  <TableCell className="font-medium text-blue-700">
-                                    {enrollStats?.total ?? 0}
-                                  </TableCell>
-                                  <TableCell className="border-r">
-                                    {eErr > 0 ? (
-                                      <Badge
-                                        variant="destructive"
-                                        className="text-xs"
-                                      >
-                                        {eErr}
-                                      </Badge>
-                                    ) : (
-                                      <span className="text-green-600 text-sm">
-                                        0
+                                  Branch
+                                </TableHead>
+                                <TableHead
+                                  colSpan={2}
+                                  className="text-center text-blue-700 border-r bg-blue-50/50"
+                                >
+                                  Enrollment
+                                </TableHead>
+                                <TableHead
+                                  colSpan={5}
+                                  className="text-center text-purple-700 bg-purple-50/50"
+                                >
+                                  Exam Registration
+                                </TableHead>
+                              </TableRow>
+                              <TableRow className="bg-muted/30">
+                                <TableHead className="text-blue-600 text-xs">
+                                  Total
+                                </TableHead>
+                                <TableHead className="text-blue-600 text-xs border-r">
+                                  Errors
+                                </TableHead>
+                                <TableHead className="text-purple-600 text-xs">
+                                  Total
+                                </TableHead>
+                                <TableHead className="text-purple-600 text-xs">
+                                  Done
+                                </TableHead>
+                                <TableHead className="text-purple-600 text-xs">
+                                  Redo
+                                </TableHead>
+                                <TableHead className="text-purple-600 text-xs">
+                                  Do First
+                                </TableHead>
+                                <TableHead className="text-purple-600 text-xs">
+                                  Errors
+                                </TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {BRANCHES.map((branch, i) => {
+                                const eStats = enrollBranchStats.find(
+                                  (b) => b.branch === branch,
+                                );
+                                const rStats = examRegBranchStats.find(
+                                  (b) => b.branch === branch,
+                                );
+                                return (
+                                  <TableRow
+                                    key={branch}
+                                    data-ocid={`dean.overview.row.${i + 1}`}
+                                  >
+                                    <TableCell className="border-r">
+                                      <Badge variant="outline">{branch}</Badge>
+                                    </TableCell>
+                                    <TableCell className="font-medium text-blue-700">
+                                      {eStats?.total ?? 0}
+                                    </TableCell>
+                                    <TableCell className="border-r">
+                                      {(eStats?.errors ?? 0) > 0 ? (
+                                        <Badge
+                                          variant="destructive"
+                                          className="text-xs"
+                                        >
+                                          {eStats?.errors}
+                                        </Badge>
+                                      ) : (
+                                        <span className="text-green-600 text-sm">
+                                          0
+                                        </span>
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="font-medium text-purple-700">
+                                      {rStats?.total ?? 0}
+                                    </TableCell>
+                                    <TableCell>
+                                      <span className="text-green-700 font-medium">
+                                        {rStats?.done ?? 0}
                                       </span>
-                                    )}
-                                  </TableCell>
-                                  <TableCell className="font-medium text-purple-700">
-                                    {examTotal}
-                                  </TableCell>
-                                  <TableCell>
-                                    <span className="text-green-700 font-medium">
-                                      {examStats?.done ?? 0}
-                                    </span>
-                                  </TableCell>
-                                  <TableCell>
-                                    <span className="text-amber-600 font-medium">
-                                      {examStats?.redo ?? 0}
-                                    </span>
-                                  </TableCell>
-                                  <TableCell>
-                                    <span className="text-red-600 font-medium">
-                                      {examStats?.doFirst ?? 0}
-                                    </span>
-                                  </TableCell>
-                                  <TableCell>
-                                    {rErr > 0 ? (
-                                      <Badge
-                                        variant="destructive"
-                                        className="text-xs"
-                                      >
-                                        {rErr}
-                                      </Badge>
-                                    ) : (
-                                      <span className="text-green-600 text-sm">
-                                        0
+                                    </TableCell>
+                                    <TableCell>
+                                      <span className="text-amber-600 font-medium">
+                                        {rStats?.redo ?? 0}
                                       </span>
-                                    )}
-                                  </TableCell>
-                                </TableRow>
-                              );
-                            })}
-                          </TableBody>
-                        </Table>
-                      </div>
-                    </CardContent>
-                  </Card>
-                </>
+                                    </TableCell>
+                                    <TableCell>
+                                      <span className="text-red-600 font-medium">
+                                        {rStats?.doFirst ?? 0}
+                                      </span>
+                                    </TableCell>
+                                    <TableCell>
+                                      {(rStats?.errors ?? 0) > 0 ? (
+                                        <Badge
+                                          variant="destructive"
+                                          className="text-xs"
+                                        >
+                                          {rStats?.errors}
+                                        </Badge>
+                                      ) : (
+                                        <span className="text-green-600 text-sm">
+                                          0
+                                        </span>
+                                      )}
+                                    </TableCell>
+                                  </TableRow>
+                                );
+                              })}
+                            </TableBody>
+                          </Table>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )}
+                </div>
               )}
             </TabsContent>
 
             {/* ── Data Upload ── */}
             <TabsContent value="data-upload">
               <div className="space-y-6">
-                {/* Refresh button */}
-                {(deanStudentDataUploaded || deanExamRegDataUploaded) && (
-                  <div className="flex justify-end">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={handleRefresh}
-                      className="gap-2"
-                      data-ocid="dean.data_upload.refresh.button"
-                    >
-                      <RefreshCw className="h-4 w-4" />
-                      Refresh / Update Data
-                    </Button>
-                  </div>
-                )}
-                {/* NPTEL Enrollment Data */}
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="font-display text-base flex items-center gap-2">
-                      <Upload className="h-4 w-4 text-primary" />
-                      NPTEL Enrollment Data
-                    </CardTitle>
-                    <CardDescription>
-                      Upload NPTEL enrollment CSV/Excel files. Multiple uploads
-                      supported — each upload appends records.
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div
-                      data-ocid="dean.student_upload.success_state"
-                      className="space-y-3"
-                    >
-                      {/* Uploaded file list */}
-                      {enrollmentFileNames.length > 0 && (
-                        <div className="space-y-2">
-                          {enrollmentFileNames.map((fname) => (
-                            <div
-                              key={fname}
-                              className="flex items-center gap-3 p-3 rounded-lg bg-green-50 border border-green-200"
-                            >
-                              <CheckCircle2 className="h-4 w-4 text-green-600 shrink-0" />
-                              <p className="text-sm font-medium text-green-700 flex-1 truncate">
-                                {fname}
-                              </p>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() =>
-                                  handleRemoveEnrollmentFile(fname)
-                                }
-                                className="h-7 w-7 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
-                                data-ocid="dean.student_upload.delete_button"
-                                title="Remove this file"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </Button>
-                            </div>
-                          ))}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                  <UploadCard
+                    title="NPTEL Enrollment Data"
+                    description="Upload NPTEL enrollment CSV/Excel. Multiple uploads supported."
+                    icon={Upload}
+                    fileNames={enrollmentFileNames}
+                    onRemove={handleRemoveEnrollmentFile}
+                    inputId="student-data-file"
+                    inputRef={studentDataFileRef}
+                    onChange={handleStudentDataUpload}
+                    isParsing={parsingFile !== null}
+                    fileOcid="dean.student_upload.delete_button"
+                    dropzoneOcid="dean.student_upload.dropzone"
+                    extra={
+                      <>
+                        {enrollmentFileNames.length > 0 && (
                           <p className="text-xs text-muted-foreground px-1">
-                            {
-                              uploadedStudentRecords.filter(
-                                (r) =>
-                                  r.profession?.toLowerCase() !== "faculty",
-                              ).length
-                            }{" "}
-                            student records loaded · {enrollmentErrors.length}{" "}
-                            errors found
+                            {enrollmentFileRecordCount} records ·{" "}
+                            {enrollmentErrors.length} errors
                           </p>
-                        </div>
-                      )}
-                      {/* Upload dropzone — always visible */}
-                      <label
-                        htmlFor="student-data-file"
-                        data-ocid="dean.student_upload.dropzone"
-                        className="flex items-center gap-3 p-4 rounded-lg border-2 border-dashed border-primary/40 bg-primary/5 cursor-pointer hover:bg-primary/10 transition-colors"
-                      >
-                        <PlusCircle className="h-6 w-6 text-primary shrink-0" />
-                        <div>
-                          <p className="font-medium text-sm">
-                            {enrollmentFileNames.length > 0
-                              ? "Upload another enrollment file"
-                              : "Click to upload student enrollment CSV/Excel"}
-                          </p>
-                          <p className="text-xs text-muted-foreground mt-0.5">
-                            Multiple files supported — each upload appends
-                            records
-                          </p>
-                        </div>
-                      </label>
-                      {enrollmentFileHeaders.length > 0 && (
-                        <div className="p-3 rounded-lg bg-muted/50 border text-xs text-muted-foreground">
-                          <span className="font-medium text-foreground">
-                            Detected columns ({enrollmentFileHeaders.length}):{" "}
-                          </span>
-                          {enrollmentFileHeaders.join(" | ")}
-                        </div>
-                      )}
-                    </div>
-                    <input
-                      ref={studentDataFileRef}
-                      id="student-data-file"
-                      type="file"
-                      accept=".csv,.xlsx,.xls"
-                      className="hidden"
-                      onChange={handleStudentDataUpload}
-                      data-ocid="dean.student_upload.upload_button"
-                    />
-                    {/* Previous Files Selector */}
-                    {enrollmentFileSnapshots.length > 0 && (
-                      <div className="mt-4 p-3 rounded-lg border bg-muted/30">
-                        <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1">
-                          <FileText className="h-3.5 w-3.5" /> Previous
-                          Enrollment Files
-                        </p>
-                        <div className="space-y-1">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setSelectedEnrollmentSnapshotIdx(null)
-                            }
-                            className={`w-full flex items-center justify-between p-2 rounded cursor-pointer text-xs ${selectedEnrollmentSnapshotIdx === null ? "bg-primary/10 border border-primary/30 font-medium" : "hover:bg-muted/50"}`}
-                          >
-                            <span>Latest (current)</span>
-                            <Badge variant="outline" className="text-xs">
-                              Active
-                            </Badge>
-                          </button>
-                          {enrollmentFileSnapshots.map((snap, idx) => (
-                            <div
-                              key={snap.timestamp}
-                              className={`w-full flex items-center justify-between p-2 rounded text-xs ${selectedEnrollmentSnapshotIdx === idx ? "bg-amber-50 border border-amber-300 font-medium" : "hover:bg-muted/50"}`}
-                            >
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setSelectedEnrollmentSnapshotIdx(idx)
-                                }
-                                className="flex items-center gap-1 flex-1 truncate text-left cursor-pointer"
-                              >
-                                <span className="truncate flex-1">
-                                  {snap.fileName}
-                                </span>
-                                <span className="text-muted-foreground ml-2 shrink-0">
-                                  {new Date(
-                                    snap.timestamp,
-                                  ).toLocaleDateString()}
-                                </span>
-                              </button>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-6 px-2 text-xs ml-2 shrink-0 border-blue-300 text-blue-600 hover:bg-blue-50"
-                                onClick={() => {
-                                  setUploadedStudentRecords(snap.records);
-                                  setEnrollmentErrors(
-                                    snap.errors as EnrollmentError[],
-                                  );
-                                  setSelectedEnrollmentSnapshotIdx(null);
-                                  toast.success(
-                                    `Restored enrollment data from "${snap.fileName}"`,
-                                  );
-                                }}
-                              >
-                                Restore
-                              </Button>
-                            </div>
-                          ))}
-                        </div>
-                        {selectedEnrollmentSnapshotIdx !== null && (
-                          <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800">
-                            ⚠️ Viewing historical data from{" "}
-                            <strong>
-                              {
-                                enrollmentFileSnapshots[
-                                  selectedEnrollmentSnapshotIdx
-                                ]?.fileName
-                              }
-                            </strong>{" "}
-                            uploaded on{" "}
-                            {new Date(
-                              enrollmentFileSnapshots[
-                                selectedEnrollmentSnapshotIdx
-                              ]?.timestamp,
-                            ).toLocaleString()}
-                            . This is not the current active data.
+                        )}
+                        {enrollmentFileHeaders.length > 0 && (
+                          <div className="p-3 rounded-lg bg-muted/50 border text-xs text-muted-foreground">
+                            <span className="font-medium text-foreground">
+                              Detected columns ({enrollmentFileHeaders.length}):{" "}
+                            </span>
+                            {enrollmentFileHeaders.join(" | ")}
                           </div>
                         )}
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
+                        <SnapshotSelector
+                          snapshots={enrollLocalSnapshots}
+                          selectedIdx={selectedEnrollmentSnapshotIdx}
+                          onSelect={setSelectedEnrollmentSnapshotIdx}
+                          onRestore={(snap) => {
+                            setUploadedStudentRecords(
+                              snap.records,
+                              snap.records.length,
+                            );
+                            setEnrollmentErrors(
+                              snap.errors as EnrollmentError[],
+                            );
+                            toast.success(
+                              `Restored enrollment data from "${snap.fileName}"`,
+                            );
+                          }}
+                          label="Enrollment"
+                        />
+                      </>
+                    }
+                  />
 
-                {/* NPTEL Exam Registration Data — active in parallel with enrollment */}
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="font-display text-base flex items-center gap-2">
-                      <FileText className="h-4 w-4 text-primary" />
-                      NPTEL Exam Registration Data
-                    </CardTitle>
-                    <CardDescription>
-                      Upload NPTEL exam registration CSV/Excel files. Payment
-                      status and exam details — upload in parallel with
-                      enrollment.
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div
-                      data-ocid="dean.exam_upload.success_state"
-                      className="space-y-3"
-                    >
-                      {/* Uploaded exam reg file list */}
-                      {examRegFileNames.length > 0 && (
-                        <div className="space-y-2">
-                          {examRegFileNames.map((fname) => (
-                            <div
-                              key={fname}
-                              className="flex items-center gap-3 p-3 rounded-lg bg-green-50 border border-green-200"
-                            >
-                              <CheckCircle2 className="h-4 w-4 text-green-600 shrink-0" />
-                              <p className="text-sm font-medium text-green-700 flex-1 truncate">
-                                {fname}
-                              </p>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => handleRemoveExamRegFile(fname)}
-                                className="h-7 w-7 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
-                                data-ocid="dean.exam_upload.delete_button"
-                                title="Remove this file"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </Button>
-                            </div>
-                          ))}
+                  <UploadCard
+                    title="NPTEL Exam Registration Data"
+                    description="Upload exam registration CSV/Excel. Upload in parallel with enrollment."
+                    icon={FileText}
+                    fileNames={examRegFileNames}
+                    onRemove={handleRemoveExamRegFile}
+                    inputId="exam-reg-file"
+                    inputRef={examRegFileRef}
+                    onChange={handleExamRegUpload}
+                    fileOcid="dean.exam_upload.delete_button"
+                    dropzoneOcid="dean.exam_upload.dropzone"
+                    extra={
+                      <>
+                        {examRegFileNames.length > 0 && (
                           <p className="text-xs text-muted-foreground px-1">
-                            {examRegErrors.length} exam registration errors
-                            found
+                            {examRegFileRecordCount} records ·{" "}
+                            {examRegErrors.length} errors
                           </p>
-                        </div>
-                      )}
-                      {/* Upload dropzone — always visible */}
-                      <label
-                        htmlFor="exam-reg-file"
-                        data-ocid="dean.exam_upload.dropzone"
-                        className="flex items-center gap-3 p-4 rounded-lg border-2 border-dashed border-primary/40 bg-primary/5 cursor-pointer hover:bg-primary/10 transition-colors"
-                      >
-                        <PlusCircle className="h-6 w-6 text-primary shrink-0" />
-                        <div>
-                          <p className="font-medium text-sm">
-                            {examRegFileNames.length > 0
-                              ? "Upload another exam registration file"
-                              : "Click to upload exam registration CSV/Excel"}
-                          </p>
-                          <p className="text-xs text-muted-foreground mt-0.5">
-                            Payment status and exam details — upload in parallel
-                            with enrollment
-                          </p>
-                        </div>
-                      </label>
-                    </div>
-                    <input
-                      ref={examRegFileRef}
-                      id="exam-reg-file"
-                      type="file"
-                      accept=".csv,.xlsx,.xls"
-                      className="hidden"
-                      onChange={handleExamRegUpload}
-                      data-ocid="dean.exam_upload.upload_button"
-                    />
-                    {/* Previous Files Selector */}
-                    {examRegFileSnapshots.length > 0 && (
-                      <div className="mt-4 p-3 rounded-lg border bg-muted/30">
-                        <p className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1">
-                          <FileText className="h-3.5 w-3.5" /> Previous Exam Reg
-                          Files
-                        </p>
-                        <div className="space-y-1">
-                          <button
-                            type="button"
-                            onClick={() => setSelectedExamRegSnapshotIdx(null)}
-                            className={`w-full flex items-center justify-between p-2 rounded cursor-pointer text-xs ${selectedExamRegSnapshotIdx === null ? "bg-primary/10 border border-primary/30 font-medium" : "hover:bg-muted/50"}`}
-                          >
-                            <span>Latest (current)</span>
-                            <Badge variant="outline" className="text-xs">
-                              Active
-                            </Badge>
-                          </button>
-                          {examRegFileSnapshots.map((snap, idx) => (
-                            <div
-                              key={snap.timestamp}
-                              className={`w-full flex items-center justify-between p-2 rounded text-xs ${selectedExamRegSnapshotIdx === idx ? "bg-amber-50 border border-amber-300 font-medium" : "hover:bg-muted/50"}`}
-                            >
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setSelectedExamRegSnapshotIdx(idx)
-                                }
-                                className="flex items-center gap-1 flex-1 truncate text-left cursor-pointer"
-                              >
-                                <span className="truncate flex-1">
-                                  {snap.fileName}
-                                </span>
-                                <span className="text-muted-foreground ml-2 shrink-0">
-                                  {new Date(
-                                    snap.timestamp,
-                                  ).toLocaleDateString()}
-                                </span>
-                              </button>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-6 px-2 text-xs ml-2 shrink-0 border-blue-300 text-blue-600 hover:bg-blue-50"
-                                onClick={() => {
-                                  setExamRegErrors(
-                                    snap.errors as ExamRegError[],
-                                  );
-                                  setSelectedExamRegSnapshotIdx(null);
-                                  toast.success(
-                                    `Restored exam reg data from "${snap.fileName}"`,
-                                  );
-                                }}
-                              >
-                                Restore
-                              </Button>
-                            </div>
-                          ))}
-                        </div>
-                        {selectedExamRegSnapshotIdx !== null && (
-                          <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800">
-                            ⚠️ Viewing historical data from{" "}
-                            <strong>
-                              {
-                                examRegFileSnapshots[selectedExamRegSnapshotIdx]
-                                  ?.fileName
-                              }
-                            </strong>{" "}
-                            uploaded on{" "}
-                            {new Date(
-                              examRegFileSnapshots[selectedExamRegSnapshotIdx]
-                                ?.timestamp,
-                            ).toLocaleString()}
-                            . This is not the current active data.
-                          </div>
                         )}
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
+                        <SnapshotSelector
+                          snapshots={examRegLocalSnapshots}
+                          selectedIdx={selectedExamRegSnapshotIdx}
+                          onSelect={setSelectedExamRegSnapshotIdx}
+                          onRestore={(snap) => {
+                            setUploadedExamRegRecords(
+                              snap.records,
+                              snap.records.length,
+                            );
+                            setExamRegErrors(snap.errors as ExamRegError[]);
+                            toast.success(
+                              `Restored exam reg data from "${snap.fileName}"`,
+                            );
+                          }}
+                          label="Exam Reg"
+                        />
+                      </>
+                    }
+                  />
 
-                {/* Exam Shuffle Data Upload — separate section */}
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="font-display text-base flex items-center gap-2">
-                      <Shuffle className="h-4 w-4 text-indigo-600" />
-                      Exam Shuffle Data Upload
-                    </CardTitle>
-                    <CardDescription>
-                      Upload the NPTEL exam shuffle CSV/Excel file. Students can
-                      view their exam center, date, and slot only after this
-                      file is uploaded.
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div
-                      data-ocid="dean.shuffle_upload.success_state"
-                      className="space-y-3"
-                    >
-                      {shuffleFileNames.length > 0 && (
-                        <div className="space-y-2">
-                          {shuffleFileNames.map((fname) => (
-                            <div
-                              key={fname}
-                              className="flex items-center gap-3 p-3 rounded-lg bg-indigo-50 border border-indigo-200"
-                            >
-                              <CheckCircle2 className="h-4 w-4 text-indigo-600 shrink-0" />
-                              <p className="text-sm font-medium text-indigo-700 flex-1 truncate">
-                                {fname}
-                              </p>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => handleRemoveShuffleFile(fname)}
-                                className="h-7 w-7 p-0 text-red-500 hover:text-red-700 hover:bg-red-50"
-                                data-ocid="dean.shuffle_upload.delete_button"
-                                title="Remove this file"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </Button>
-                            </div>
-                          ))}
-                          <p className="text-xs text-muted-foreground px-1">
-                            {uploadedShuffleRecords.length} student shuffle
-                            records loaded
-                          </p>
-                        </div>
-                      )}
-                      <label
-                        htmlFor="shuffle-file"
-                        data-ocid="dean.shuffle_upload.dropzone"
-                        className="flex items-center gap-3 p-4 rounded-lg border-2 border-dashed border-indigo-300 bg-indigo-50/50 cursor-pointer hover:bg-indigo-50 transition-colors"
-                      >
-                        <PlusCircle className="h-6 w-6 text-indigo-600 shrink-0" />
-                        <div>
-                          <p className="font-medium text-sm">
-                            {shuffleFileNames.length > 0
-                              ? "Upload another shuffle file"
-                              : "Click to upload exam shuffle CSV/Excel"}
-                          </p>
-                          <p className="text-xs text-muted-foreground mt-0.5">
-                            Exam center, date, time slot per student
-                          </p>
-                        </div>
-                      </label>
-                    </div>
-                    <input
-                      ref={shuffleFileRef}
-                      id="shuffle-file"
-                      type="file"
-                      accept=".csv,.xlsx,.xls"
-                      className="hidden"
-                      onChange={handleShuffleUpload}
-                      data-ocid="dean.shuffle_upload.upload_button"
-                    />
-                  </CardContent>
-                </Card>
+                  <UploadCard
+                    title="Exam Shuffle Data"
+                    description="Upload the exam shuffle CSV/Excel. Students view details only after this."
+                    icon={Shuffle}
+                    iconColor="text-indigo-600"
+                    fileNames={shuffleFileNames}
+                    onRemove={handleRemoveShuffleFile}
+                    inputId="shuffle-file"
+                    inputRef={shuffleFileRef}
+                    onChange={handleShuffleUpload}
+                    fileOcid="dean.shuffle_upload.delete_button"
+                    dropzoneOcid="dean.shuffle_upload.dropzone"
+                    borderColor="border-indigo-300"
+                    bgColor="bg-indigo-50/50"
+                    hoverBgColor="hover:bg-indigo-50"
+                    extra={
+                      shuffleFileNames.length > 0 ? (
+                        <p className="text-xs text-muted-foreground px-1">
+                          {uploadedShuffleRecords.length} shuffle records loaded
+                        </p>
+                      ) : undefined
+                    }
+                  />
+                </div>
               </div>
             </TabsContent>
 
@@ -1499,20 +1738,24 @@ export default function DeanDashboard() {
                     HOD Permissions Management
                   </CardTitle>
                   <CardDescription>
-                    Control upload and edit access for each department HOD.
+                    Control upload access and edit credits for each department
+                    HOD.
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-4" data-ocid="dean.permissions.table">
                     {BRANCHES.map((branch, i) => {
-                      const perm = pendingPerms[branch];
+                      const perm = pendingPerms[branch] ?? {
+                        branch,
+                        canUpload: false,
+                        uploadCredits: 0,
+                      };
                       return (
                         <div
                           key={branch}
                           data-ocid={`dean.permissions.row.${i + 1}`}
                           className="rounded-lg border p-4 flex flex-wrap items-center gap-4"
                         >
-                          {/* Branch */}
                           <div className="w-16">
                             <Badge
                               variant="outline"
@@ -1521,104 +1764,65 @@ export default function DeanDashboard() {
                               {branch}
                             </Badge>
                           </div>
-
-                          {/* Enrollment Upload Toggle */}
                           <div className="flex items-center gap-2">
                             <Switch
-                              id={`enroll-toggle-${branch}`}
-                              checked={perm.canUploadEnrollment}
+                              id={`upload-toggle-${branch}`}
+                              checked={perm.canUpload}
                               onCheckedChange={(v) =>
                                 setPendingPerms((prev) => ({
                                   ...prev,
-                                  [branch]: {
-                                    ...prev[branch],
-                                    canUploadEnrollment: v,
-                                  },
+                                  [branch]: { ...prev[branch], canUpload: v },
                                 }))
                               }
-                              data-ocid={`dean.permissions.enrollment_toggle.${i + 1}`}
+                              data-ocid={`dean.permissions.upload_toggle.${i + 1}`}
                             />
                             <Label
-                              htmlFor={`enroll-toggle-${branch}`}
+                              htmlFor={`upload-toggle-${branch}`}
                               className="text-sm cursor-pointer"
                             >
-                              Enrollment Upload
+                              Allow Upload
                             </Label>
                           </div>
-
-                          {/* Enrollment Edits count */}
                           <div className="flex items-center gap-2">
                             <Label className="text-xs text-muted-foreground whitespace-nowrap">
-                              Enrollment Edits:
+                              Upload Credits:
                             </Label>
                             <Input
                               type="number"
                               min={0}
                               max={20}
-                              value={perm.enrollmentEdits}
+                              value={perm.uploadCredits}
                               onChange={(e) =>
                                 setPendingPerms((prev) => ({
                                   ...prev,
                                   [branch]: {
                                     ...prev[branch],
-                                    enrollmentEdits: Number(e.target.value),
+                                    uploadCredits: Number(e.target.value),
                                   },
                                 }))
                               }
                               className="h-8 w-16 text-sm"
-                              data-ocid={`dean.permissions.enrollment_edits.input.${i + 1}`}
+                              data-ocid={`dean.permissions.credits.input.${i + 1}`}
                             />
-                          </div>
-
-                          {/* Exam Reg Upload Toggle */}
-                          <div className="flex items-center gap-2">
-                            <Switch
-                              id={`exam-toggle-${branch}`}
-                              checked={perm.canUploadExamReg}
-                              onCheckedChange={(v) =>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-8 px-2 text-xs gap-1"
+                              onClick={() =>
                                 setPendingPerms((prev) => ({
                                   ...prev,
                                   [branch]: {
                                     ...prev[branch],
-                                    canUploadExamReg: v,
+                                    uploadCredits:
+                                      (prev[branch]?.uploadCredits ?? 0) + 1,
                                   },
                                 }))
                               }
-                              data-ocid={`dean.permissions.exam_toggle.${i + 1}`}
-                            />
-                            <Label
-                              htmlFor={`exam-toggle-${branch}`}
-                              className="text-sm cursor-pointer"
+                              data-ocid={`dean.permissions.add_credits.${i + 1}`}
                             >
-                              Exam Reg Upload
-                            </Label>
+                              +1 Credit
+                            </Button>
                           </div>
-
-                          {/* Exam Reg Edits count */}
-                          <div className="flex items-center gap-2">
-                            <Label className="text-xs text-muted-foreground whitespace-nowrap">
-                              Exam Reg Edits:
-                            </Label>
-                            <Input
-                              type="number"
-                              min={0}
-                              max={20}
-                              value={perm.examRegEdits}
-                              onChange={(e) =>
-                                setPendingPerms((prev) => ({
-                                  ...prev,
-                                  [branch]: {
-                                    ...prev[branch],
-                                    examRegEdits: Number(e.target.value),
-                                  },
-                                }))
-                              }
-                              className="h-8 w-16 text-sm"
-                              data-ocid={`dean.permissions.exam_edits.input.${i + 1}`}
-                            />
-                          </div>
-
-                          {/* Save button */}
                           <Button
                             size="sm"
                             onClick={() => savePerms(branch)}
@@ -1646,8 +1850,8 @@ export default function DeanDashboard() {
                       Upload Course File
                     </CardTitle>
                     <CardDescription>
-                      Upload master course CSV/Excel for all branches (12-week
-                      courses will be displayed)
+                      Upload master course CSV/Excel for 12-week courses
+                      (visible to all HODs and Dean).
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -1671,23 +1875,11 @@ export default function DeanDashboard() {
                         {courseFileHeaders.length > 0 && (
                           <div className="p-3 rounded-lg bg-muted/50 border text-xs text-muted-foreground">
                             <span className="font-medium text-foreground">
-                              Detected columns ({courseFileHeaders.length}):{" "}
+                              Detected columns:{" "}
                             </span>
                             {courseFileHeaders.join(" | ")}
                           </div>
                         )}
-                        {uploadedCourses.length === 0 &&
-                          courseFileHeaders.length > 0 && (
-                            <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800">
-                              <strong>0 courses loaded.</strong> The parser
-                              looks for a Duration/Weeks column with value "12".
-                              If your file uses a different column name for
-                              duration, the courses above show the detected
-                              column names. If all courses are 12-week in the
-                              file and there is no duration column, they will
-                              still be included.
-                            </div>
-                          )}
                       </div>
                     ) : (
                       <label
@@ -1718,110 +1910,16 @@ export default function DeanDashboard() {
                   </CardContent>
                 </Card>
 
-                {/* Branch-wise course count summary — click to filter */}
-                {deanCourseFileUploaded && (
-                  <Card>
-                    <CardHeader>
-                      <CardTitle className="font-display text-base flex items-center gap-2">
-                        <BookOpen className="h-4 w-4 text-primary" />
-                        Branch-wise 12-Week Course Count
-                      </CardTitle>
-                      <CardDescription>
-                        Click a branch to filter the course table below
-                      </CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                      <div
-                        className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3"
-                        data-ocid="dean.courses.branch_summary"
-                      >
-                        {/* "All" card */}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setCourseBranchFilter("All");
-                            setCoursePage(1);
-                          }}
-                          className={`flex flex-col items-center justify-center rounded-lg border p-3 text-center gap-1 cursor-pointer transition-colors w-full ${
-                            courseBranchFilter === "All"
-                              ? "bg-primary text-primary-foreground border-primary"
-                              : "bg-muted/30 hover:bg-muted/60"
-                          }`}
-                          data-ocid="dean.courses.branch_all.button"
-                        >
-                          <Badge
-                            variant={
-                              courseBranchFilter === "All"
-                                ? "secondary"
-                                : "outline"
-                            }
-                            className="font-display font-bold text-sm mb-1"
-                          >
-                            All
-                          </Badge>
-                          <span
-                            className={`text-2xl font-display font-bold ${courseBranchFilter === "All" ? "text-primary-foreground" : "text-primary"}`}
-                          >
-                            {uploadedCourses.length}
-                          </span>
-                          <span className="text-xs opacity-70">courses</span>
-                        </button>
-                        {BRANCHES.map((branch) => {
-                          const count = uploadedCourses.filter(
-                            (c) => c.branch === branch,
-                          ).length;
-                          const isSelected = courseBranchFilter === branch;
-                          return (
-                            <button
-                              type="button"
-                              key={branch}
-                              onClick={() => {
-                                setCourseBranchFilter(branch);
-                                setCoursePage(1);
-                              }}
-                              className={`flex flex-col items-center justify-center rounded-lg border p-3 text-center gap-1 cursor-pointer transition-colors w-full ${
-                                isSelected
-                                  ? "bg-primary text-primary-foreground border-primary"
-                                  : "bg-muted/30 hover:bg-muted/60"
-                              }`}
-                              data-ocid={`dean.courses.branch_card.${branch.toLowerCase()}`}
-                            >
-                              <Badge
-                                variant={isSelected ? "secondary" : "outline"}
-                                className="font-display font-bold text-sm mb-1"
-                              >
-                                {branch}
-                              </Badge>
-                              <span
-                                className={`text-2xl font-display font-bold ${isSelected ? "text-primary-foreground" : "text-primary"}`}
-                              >
-                                {count}
-                              </span>
-                              <span className="text-xs opacity-70">
-                                {count === 1 ? "course" : "courses"}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </CardContent>
-                  </Card>
-                )}
-
                 <Card>
                   <CardHeader>
-                    <div className="flex items-center justify-between flex-wrap gap-3">
-                      <CardTitle className="font-display text-base">
-                        12-Week Courses
-                        {deanCourseFileUploaded && (
-                          <span className="ml-2 text-sm font-normal text-muted-foreground">
-                            {courseBranchFilter === "All"
-                              ? `(${filteredCourses.length} total)`
-                              : `— ${courseBranchFilter} (${filteredCourses.length})`}
-                          </span>
-                        )}
-                      </CardTitle>
-                    </div>
+                    <CardTitle className="font-display text-base">
+                      12-Week Courses
+                      {deanCourseFileUploaded && (
+                        <span className="ml-2 text-sm font-normal text-muted-foreground">
+                          ({filteredCourses.length} total)
+                        </span>
+                      )}
+                    </CardTitle>
                   </CardHeader>
                   <CardContent>
                     {!deanCourseFileUploaded ? (
@@ -1840,11 +1938,10 @@ export default function DeanDashboard() {
                         data-ocid="dean.courses.empty_state"
                         className="text-center py-10 text-muted-foreground"
                       >
-                        <p>No 12-week courses found for the selected branch.</p>
+                        <p>No 12-week courses found.</p>
                       </div>
                     ) : (
                       <div className="space-y-3">
-                        {/* Row count info */}
                         <p className="text-xs text-muted-foreground px-1">
                           Showing {(coursePage - 1) * COURSE_PAGE_SIZE + 1}–
                           {Math.min(
@@ -1868,50 +1965,37 @@ export default function DeanDashboard() {
                                 <TableHead>Course ID</TableHead>
                                 <TableHead>Course Name</TableHead>
                                 <TableHead>Duration</TableHead>
-                                <TableHead>Branch</TableHead>
                               </TableRow>
                             </TableHeader>
                             <TableBody>
-                              {filteredCourses
-                                .slice(
-                                  (coursePage - 1) * COURSE_PAGE_SIZE,
-                                  coursePage * COURSE_PAGE_SIZE,
-                                )
-                                .map((c, i) => (
-                                  <TableRow
-                                    key={`${c.courseId}-${i}`}
-                                    data-ocid={`dean.courses.row.${i + 1}`}
-                                  >
-                                    <TableCell className="text-muted-foreground text-xs">
-                                      {(coursePage - 1) * COURSE_PAGE_SIZE +
-                                        i +
-                                        1}
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {c.courseId}
-                                    </TableCell>
-                                    <TableCell>{c.courseName}</TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs"
-                                      >
-                                        {c.durationWeeks} weeks
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge variant="secondary">
-                                        {c.branch}
-                                      </Badge>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
+                              {pagedCourses.map((c, i) => (
+                                <TableRow
+                                  key={`${c.courseId}-${i}`}
+                                  data-ocid={`dean.courses.row.${i + 1}`}
+                                >
+                                  <TableCell className="text-muted-foreground text-xs">
+                                    {(coursePage - 1) * COURSE_PAGE_SIZE +
+                                      i +
+                                      1}
+                                  </TableCell>
+                                  <TableCell className="font-mono text-sm">
+                                    {c.courseId}
+                                  </TableCell>
+                                  <TableCell>{c.courseName}</TableCell>
+                                  <TableCell>
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {c.duration}
+                                    </Badge>
+                                  </TableCell>
+                                </TableRow>
+                              ))}
                             </TableBody>
                           </Table>
                         </div>
-                        {/* Pagination controls */}
-                        {Math.ceil(filteredCourses.length / COURSE_PAGE_SIZE) >
-                          1 && (
+                        {totalCoursePages > 1 && (
                           <div className="flex items-center justify-between pt-2">
                             <Button
                               variant="outline"
@@ -1925,30 +2009,17 @@ export default function DeanDashboard() {
                               Previous
                             </Button>
                             <span className="text-sm text-muted-foreground">
-                              Page {coursePage} of{" "}
-                              {Math.ceil(
-                                filteredCourses.length / COURSE_PAGE_SIZE,
-                              )}
+                              Page {coursePage} of {totalCoursePages}
                             </span>
                             <Button
                               variant="outline"
                               size="sm"
                               onClick={() =>
                                 setCoursePage((p) =>
-                                  Math.min(
-                                    Math.ceil(
-                                      filteredCourses.length / COURSE_PAGE_SIZE,
-                                    ),
-                                    p + 1,
-                                  ),
+                                  Math.min(totalCoursePages, p + 1),
                                 )
                               }
-                              disabled={
-                                coursePage ===
-                                Math.ceil(
-                                  filteredCourses.length / COURSE_PAGE_SIZE,
-                                )
-                              }
+                              disabled={coursePage === totalCoursePages}
                               data-ocid="dean.courses.pagination_next"
                             >
                               Next
@@ -1960,6 +2031,472 @@ export default function DeanDashboard() {
                   </CardContent>
                 </Card>
               </div>
+            </TabsContent>
+
+            {/* ── All Errors ── */}
+            <TabsContent value="all-errors">
+              {noDataUploaded ? (
+                <div
+                  data-ocid="dean.errors.empty_state"
+                  className="flex flex-col items-center gap-4 py-20 text-center text-muted-foreground"
+                >
+                  <AlertCircle className="h-14 w-14 text-muted-foreground/40" />
+                  <div>
+                    <p className="font-display font-bold text-lg text-foreground">
+                      No Data Uploaded
+                    </p>
+                    <p className="text-sm mt-1 max-w-sm">
+                      Upload student data to see errors.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <Card>
+                    <CardHeader>
+                      <div className="flex flex-wrap items-center gap-3 justify-between">
+                        <CardTitle className="font-display text-base flex items-center gap-2">
+                          <AlertCircle className="h-4 w-4 text-destructive" />
+                          All Student Errors
+                          <Badge variant="destructive">
+                            {filteredAllErrors.length}
+                          </Badge>
+                        </CardTitle>
+                        <ErrorFilterBar
+                          branchFilter={errorBranchFilter}
+                          onBranchChange={(v) => {
+                            setErrorBranchFilter(v);
+                            setErrorPage(1);
+                          }}
+                          typeFilter={errorTypeFilter}
+                          onTypeChange={(v) => {
+                            setErrorTypeFilter(v);
+                            setErrorPage(1);
+                          }}
+                          errorTypes={uniqueAllErrorTypes}
+                          errors={filteredAllErrors}
+                          filename={`all-errors-${new Date().toISOString().slice(0, 10)}.xlsx`}
+                          branchOcid="dean.errors.branch.select"
+                          typeOcid="dean.errors.type.select"
+                          downloadOcid="dean.errors.download_button"
+                        />
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <ErrorTable
+                        errors={pagedAllErrors}
+                        page={errorPage}
+                        pageSize={PAGE_SIZE}
+                        totalPages={totalAllErrorPages}
+                        onPrev={() => setErrorPage((p) => Math.max(1, p - 1))}
+                        onNext={() =>
+                          setErrorPage((p) =>
+                            Math.min(totalAllErrorPages, p + 1),
+                          )
+                        }
+                        theme="default"
+                        onView={openErrorDialog}
+                        ocidPrefix="dean.errors"
+                      />
+                    </CardContent>
+                  </Card>
+
+                  {/* HOD Edited Records */}
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="font-display text-base flex items-center gap-2">
+                        <PenLine className="h-4 w-4 text-indigo-600" />
+                        HOD Edited Records
+                        <Badge className="bg-indigo-100 text-indigo-800 border-indigo-200 ml-1">
+                          {hodEditedRecords.length}
+                        </Badge>
+                      </CardTitle>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Records edited by HODs — visible to both HOD and Dean.
+                      </p>
+                    </CardHeader>
+                    <CardContent>
+                      {hodEditedRecords.length === 0 ? (
+                        <div
+                          data-ocid="dean.hod_edits.empty_state"
+                          className="text-center py-10 text-muted-foreground"
+                        >
+                          <PenLine className="h-10 w-10 mx-auto mb-2 text-muted-foreground/40" />
+                          <p>
+                            No HOD edits yet. Edits made by HODs will appear
+                            here.
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          <p className="text-xs text-muted-foreground px-1">
+                            Showing {(hodEditPage - 1) * HOD_EDIT_PAGE_SIZE + 1}
+                            –
+                            {Math.min(
+                              hodEditPage * HOD_EDIT_PAGE_SIZE,
+                              hodEditedRecords.length,
+                            )}{" "}
+                            of{" "}
+                            <strong className="text-foreground">
+                              {hodEditedRecords.length}
+                            </strong>{" "}
+                            edits
+                          </p>
+                          <div
+                            className="rounded-lg border overflow-x-auto"
+                            data-ocid="dean.hod_edits.table"
+                          >
+                            <Table>
+                              <TableHeader>
+                                <TableRow className="bg-indigo-50/60">
+                                  {[
+                                    "#",
+                                    "Branch",
+                                    "Student ID",
+                                    "Course ID",
+                                    "Edited By",
+                                    "Edited At",
+                                    "Old Value",
+                                    "New Value",
+                                  ].map((h) => (
+                                    <TableHead
+                                      key={h}
+                                      className="text-indigo-700"
+                                    >
+                                      {h}
+                                    </TableHead>
+                                  ))}
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {pagedHodEdits.map((rec, i) => (
+                                  <TableRow
+                                    key={`${rec.id}-${i}`}
+                                    data-ocid={`dean.hod_edits.row.${i + 1}`}
+                                  >
+                                    <TableCell className="text-muted-foreground text-xs">
+                                      {(hodEditPage - 1) * HOD_EDIT_PAGE_SIZE +
+                                        i +
+                                        1}
+                                    </TableCell>
+                                    <TableCell>
+                                      <Badge
+                                        variant="secondary"
+                                        className="text-xs"
+                                      >
+                                        {rec.branch}
+                                      </Badge>
+                                    </TableCell>
+                                    <TableCell className="font-mono text-sm">
+                                      {rec.studentId}
+                                    </TableCell>
+                                    <TableCell className="font-mono text-sm">
+                                      {rec.courseId}
+                                    </TableCell>
+                                    <TableCell className="text-sm">
+                                      {rec.editedBy}
+                                    </TableCell>
+                                    <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
+                                      {new Date(rec.editedAt).toLocaleString(
+                                        "en-IN",
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="text-xs text-red-600 max-w-[120px] truncate">
+                                      {Object.entries(rec.oldValues ?? {})
+                                        .map(([k, v]) => `${k}: ${v}`)
+                                        .join(", ") || "-"}
+                                    </TableCell>
+                                    <TableCell className="text-xs text-green-700 max-w-[120px] truncate">
+                                      {Object.entries(rec.newValues ?? {})
+                                        .map(([k, v]) => `${k}: ${v}`)
+                                        .join(", ") || "-"}
+                                    </TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </div>
+                          {totalHodEditPages > 1 && (
+                            <div className="flex items-center justify-between pt-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() =>
+                                  setHodEditPage((p) => Math.max(1, p - 1))
+                                }
+                                disabled={hodEditPage === 1}
+                                data-ocid="dean.hod_edits.pagination_prev"
+                              >
+                                Previous
+                              </Button>
+                              <span className="text-sm text-muted-foreground">
+                                Page {hodEditPage} of {totalHodEditPages}
+                              </span>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() =>
+                                  setHodEditPage((p) =>
+                                    Math.min(totalHodEditPages, p + 1),
+                                  )
+                                }
+                                disabled={hodEditPage === totalHodEditPages}
+                                data-ocid="dean.hod_edits.pagination_next"
+                              >
+                                Next
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </CardContent>
+                  </Card>
+
+                  {/* Cross-match errors */}
+                  {crossMatchErrors.length > 0 && (
+                    <Card className="border-orange-200">
+                      <CardHeader>
+                        <CardTitle className="font-display text-base flex items-center gap-2">
+                          <AlertCircle className="h-4 w-4 text-orange-500" />
+                          Cross-match Errors (Enrollment vs Exam Registration)
+                          <Badge className="bg-orange-100 text-orange-700 border-orange-300">
+                            {crossMatchErrors.length}
+                          </Badge>
+                        </CardTitle>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Students enrolled in 12-week courses without exam
+                          registration, or exam registered without enrollment
+                        </p>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="rounded-lg border overflow-x-auto">
+                          <Table>
+                            <TableHeader>
+                              <TableRow className="bg-muted/50">
+                                {[
+                                  "Student ID",
+                                  "Email",
+                                  "Course Name",
+                                  "Course ID",
+                                  "Error Type",
+                                  "Description",
+                                  "Branch",
+                                ].map((h) => (
+                                  <TableHead key={h}>{h}</TableHead>
+                                ))}
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {crossMatchErrors.slice(0, 100).map((err, i) => (
+                                <TableRow
+                                  key={`cm-${err.studentId}-${err.courseId}-${err.errorType}`}
+                                  data-ocid={`dean.crossmatch.row.${i + 1}`}
+                                >
+                                  <TableCell className="font-mono text-xs">
+                                    {err.studentId}
+                                  </TableCell>
+                                  <TableCell className="text-xs">
+                                    {err.email}
+                                  </TableCell>
+                                  <TableCell>
+                                    <span className="font-semibold text-primary text-xs">
+                                      {err.courseName || "-"}
+                                    </span>
+                                  </TableCell>
+                                  <TableCell className="font-mono text-xs">
+                                    {err.courseId}
+                                  </TableCell>
+                                  <TableCell>
+                                    <Badge
+                                      variant={
+                                        err.errorType ===
+                                        "Missing Exam Registration"
+                                          ? "destructive"
+                                          : "outline"
+                                      }
+                                      className="text-xs whitespace-nowrap"
+                                    >
+                                      {err.errorType}
+                                    </Badge>
+                                  </TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">
+                                    {err.details}
+                                  </TableCell>
+                                  <TableCell>
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {err.branch}
+                                    </Badge>
+                                  </TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </div>
+                        {crossMatchErrors.length > 100 && (
+                          <p className="text-xs text-muted-foreground mt-2">
+                            Showing first 100 of {crossMatchErrors.length}{" "}
+                            cross-match errors.
+                          </p>
+                        )}
+                      </CardContent>
+                    </Card>
+                  )}
+                </div>
+              )}
+            </TabsContent>
+
+            {/* ── Enrollment Errors ── */}
+            <TabsContent value="enrollment-errors">
+              {!deanStudentDataUploaded ? (
+                <div
+                  data-ocid="dean.enrollment_errors.empty_state"
+                  className="flex flex-col items-center gap-4 py-20 text-center text-muted-foreground"
+                >
+                  <BookOpen className="h-14 w-14 text-muted-foreground/40" />
+                  <div>
+                    <p className="font-display font-bold text-lg text-foreground">
+                      No Enrollment Data Uploaded
+                    </p>
+                    <p className="text-sm mt-1 max-w-sm">
+                      Upload student enrollment data first to see enrollment
+                      errors.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <Card>
+                    <CardHeader>
+                      <div className="flex flex-wrap items-center gap-3 justify-between">
+                        <CardTitle className="font-display text-base flex items-center gap-2">
+                          <BookOpen className="h-4 w-4 text-blue-600" />
+                          <span className="text-blue-700">
+                            Enrollment Errors
+                          </span>
+                          <Badge variant="destructive">
+                            {filteredEnrollErrors.length}
+                          </Badge>
+                        </CardTitle>
+                        <ErrorFilterBar
+                          branchFilter={enrollErrBranchFilter}
+                          onBranchChange={(v) => {
+                            setEnrollErrBranchFilter(v);
+                            setEnrollErrPage(1);
+                          }}
+                          typeFilter={enrollErrTypeFilter}
+                          onTypeChange={(v) => {
+                            setEnrollErrTypeFilter(v);
+                            setEnrollErrPage(1);
+                          }}
+                          errorTypes={uniqueEnrollErrTypes}
+                          errors={filteredEnrollErrors}
+                          filename={`enrollment-errors-${new Date().toISOString().slice(0, 10)}.xlsx`}
+                          branchOcid="dean.enrollment_errors.branch.select"
+                          typeOcid="dean.enrollment_errors.type.select"
+                          downloadOcid="dean.enrollment_errors.download_button"
+                        />
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <ErrorTable
+                        errors={pagedEnrollErrors}
+                        page={enrollErrPage}
+                        pageSize={PAGE_SIZE}
+                        totalPages={totalEnrollErrPages}
+                        onPrev={() =>
+                          setEnrollErrPage((p) => Math.max(1, p - 1))
+                        }
+                        onNext={() =>
+                          setEnrollErrPage((p) =>
+                            Math.min(totalEnrollErrPages, p + 1),
+                          )
+                        }
+                        theme="blue"
+                        onView={openErrorDialog}
+                        ocidPrefix="dean.enrollment_errors"
+                      />
+                    </CardContent>
+                  </Card>
+                </div>
+              )}
+            </TabsContent>
+
+            {/* ── Exam Reg Errors ── */}
+            <TabsContent value="examreg-errors">
+              {!deanExamRegDataUploaded ? (
+                <div
+                  data-ocid="dean.examreg_errors.empty_state"
+                  className="flex flex-col items-center gap-4 py-20 text-center text-muted-foreground"
+                >
+                  <XCircle className="h-14 w-14 text-muted-foreground/40" />
+                  <div>
+                    <p className="font-display font-bold text-lg text-foreground">
+                      No Exam Registration Data Uploaded
+                    </p>
+                    <p className="text-sm mt-1 max-w-sm">
+                      Upload exam registration data to see errors. Go to the{" "}
+                      <strong>Data Upload</strong> tab.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <Card>
+                    <CardHeader>
+                      <div className="flex flex-wrap items-center gap-3 justify-between">
+                        <CardTitle className="font-display text-base flex items-center gap-2">
+                          <ClipboardCheck className="h-4 w-4 text-purple-600" />
+                          <span className="text-purple-700">
+                            Exam Registration Errors
+                          </span>
+                          <Badge variant="destructive">
+                            {filteredExamRegErrList.length}
+                          </Badge>
+                        </CardTitle>
+                        <ErrorFilterBar
+                          branchFilter={examErrBranchFilter}
+                          onBranchChange={(v) => {
+                            setExamErrBranchFilter(v);
+                            setExamErrPage(1);
+                          }}
+                          typeFilter={examErrTypeFilter}
+                          onTypeChange={(v) => {
+                            setExamErrTypeFilter(v);
+                            setExamErrPage(1);
+                          }}
+                          errorTypes={uniqueExamErrTypes}
+                          errors={filteredExamRegErrList}
+                          filename={`examreg-errors-${new Date().toISOString().slice(0, 10)}.xlsx`}
+                          branchOcid="dean.examreg_errors.branch.select"
+                          typeOcid="dean.examreg_errors.type.select"
+                          downloadOcid="dean.examreg_errors.download_button"
+                        />
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <ErrorTable
+                        errors={pagedExamErrors}
+                        page={examErrPage}
+                        pageSize={PAGE_SIZE}
+                        totalPages={totalExamErrPages}
+                        onPrev={() => setExamErrPage((p) => Math.max(1, p - 1))}
+                        onNext={() =>
+                          setExamErrPage((p) =>
+                            Math.min(totalExamErrPages, p + 1),
+                          )
+                        }
+                        theme="purple"
+                        showPaymentStatus
+                        onView={openErrorDialog}
+                        ocidPrefix="dean.examreg_errors"
+                      />
+                    </CardContent>
+                  </Card>
+                </div>
+              )}
             </TabsContent>
 
             {/* ── Statistics ── */}
@@ -1975,15 +2512,13 @@ export default function DeanDashboard() {
                       No Exam Registration Data
                     </p>
                     <p className="text-sm mt-1 max-w-sm">
-                      Upload the exam registration file to view statistics. Go
-                      to the <strong>Data Upload</strong> tab and upload the
-                      exam registration file.
+                      Upload the exam registration file to view statistics.
                     </p>
                   </div>
                 </div>
               ) : (
                 <div className="space-y-6">
-                  {/* ── Count cards at top ── */}
+                  {/* Count cards */}
                   <div
                     className="grid grid-cols-2 sm:grid-cols-4 gap-4"
                     data-ocid="dean.statistics.summary"
@@ -1997,7 +2532,7 @@ export default function DeanDashboard() {
                         border: "border-green-200",
                         iconColor: "text-green-600",
                         textColor: "text-green-700",
-                        desc: "Payment failed = registered",
+                        desc: "payment_complete / complete",
                       },
                       {
                         label: "Redo Registration",
@@ -2007,7 +2542,7 @@ export default function DeanDashboard() {
                         border: "border-amber-200",
                         iconColor: "text-amber-600",
                         textColor: "text-amber-700",
-                        desc: "Payment pending / draft",
+                        desc: "payment_pending / payment_draft",
                       },
                       {
                         label: "Do First Registration",
@@ -2021,7 +2556,7 @@ export default function DeanDashboard() {
                       },
                       {
                         label: "Total Students",
-                        value: totalStudents,
+                        value: examRegFileRecordCount,
                         icon: Users,
                         bg: "bg-blue-50",
                         border: "border-blue-200",
@@ -2064,7 +2599,7 @@ export default function DeanDashboard() {
                     })}
                   </div>
 
-                  {/* ── Branch-wise bar chart ── */}
+                  {/* Branch-wise bar chart */}
                   <Card>
                     <CardHeader>
                       <CardTitle className="font-display text-base">
@@ -2074,12 +2609,11 @@ export default function DeanDashboard() {
                     <CardContent>
                       <div
                         data-ocid="dean.statistics.chart"
-                        className="w-full"
                         style={{ height: 360 }}
                       >
                         <ResponsiveContainer width="100%" height="100%">
                           <BarChart
-                            data={dynamicBranchStats}
+                            data={examRegBranchStats}
                             margin={{ top: 5, right: 30, left: 0, bottom: 5 }}
                           >
                             <CartesianGrid strokeDasharray="3 3" />
@@ -2197,7 +2731,7 @@ export default function DeanDashboard() {
                               Grand Total
                             </span>
                             <span className="font-display font-bold text-xl">
-                              {totalStudents}
+                              {examRegFileRecordCount}
                             </span>
                           </div>
                         </div>
@@ -2205,11 +2739,11 @@ export default function DeanDashboard() {
                     </Card>
                   </div>
 
-                  {/* ── Branch-wise stats table ── */}
+                  {/* Branch-wise stats table */}
                   <Card>
                     <CardHeader>
                       <CardTitle className="font-display text-base">
-                        Branch-wise Registration Count
+                        Branch-wise Detailed Statistics
                       </CardTitle>
                     </CardHeader>
                     <CardContent>
@@ -2220,52 +2754,123 @@ export default function DeanDashboard() {
                         <Table>
                           <TableHeader>
                             <TableRow className="bg-muted/50">
-                              <TableHead>Branch</TableHead>
-                              <TableHead className="text-green-700">
+                              <TableHead
+                                rowSpan={2}
+                                className="align-middle border-r"
+                              >
+                                Branch
+                              </TableHead>
+                              <TableHead
+                                colSpan={2}
+                                className="text-center text-blue-700 bg-blue-50/50 border-r"
+                              >
+                                Enrollment
+                              </TableHead>
+                              <TableHead
+                                colSpan={5}
+                                className="text-center text-purple-700 bg-purple-50/50"
+                              >
+                                Exam Registration
+                              </TableHead>
+                            </TableRow>
+                            <TableRow className="bg-muted/30">
+                              <TableHead className="text-blue-600 text-xs">
+                                Total
+                              </TableHead>
+                              <TableHead className="text-blue-600 text-xs border-r">
+                                Errors
+                              </TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Total
+                              </TableHead>
+                              <TableHead className="text-green-600 text-xs">
                                 Done
                               </TableHead>
-                              <TableHead className="text-amber-600">
-                                Redo Registration
+                              <TableHead className="text-amber-600 text-xs">
+                                Redo
                               </TableHead>
-                              <TableHead className="text-red-600">
-                                Do First Registration
+                              <TableHead className="text-red-600 text-xs">
+                                Do First
                               </TableHead>
-                              <TableHead>Total</TableHead>
+                              <TableHead className="text-purple-600 text-xs">
+                                Errors
+                              </TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {dynamicBranchStats.map((stat, i) => {
-                              const branchTotal =
-                                stat.done + stat.redo + stat.doFirst;
+                            {BRANCHES.map((branch, i) => {
+                              const eStats = enrollBranchStats.find(
+                                (b) => b.branch === branch,
+                              );
+                              const rStats = examRegBranchStats.find(
+                                (b) => b.branch === branch,
+                              );
                               return (
                                 <TableRow
-                                  key={stat.branch}
+                                  key={branch}
                                   data-ocid={`dean.statistics.row.${i + 1}`}
                                 >
-                                  <TableCell>
-                                    <Badge variant="outline">
-                                      {stat.branch}
-                                    </Badge>
+                                  <TableCell className="border-r">
+                                    <Badge variant="outline">{branch}</Badge>
+                                  </TableCell>
+                                  <TableCell className="font-medium text-blue-700">
+                                    {eStats?.total ?? 0}
+                                  </TableCell>
+                                  <TableCell className="border-r">
+                                    {(eStats?.errors ?? 0) > 0 ? (
+                                      <Badge
+                                        variant="destructive"
+                                        className="text-xs"
+                                      >
+                                        {eStats?.errors}
+                                      </Badge>
+                                    ) : (
+                                      <span className="text-green-600 text-sm">
+                                        0
+                                      </span>
+                                    )}
+                                  </TableCell>
+                                  <TableCell className="font-medium text-purple-700">
+                                    {rStats?.total ?? 0}
                                   </TableCell>
                                   <TableCell className="font-medium text-green-700">
-                                    {stat.done}
+                                    {rStats?.done ?? 0}
                                   </TableCell>
                                   <TableCell className="font-medium text-amber-600">
-                                    {stat.redo}
+                                    {rStats?.redo ?? 0}
                                   </TableCell>
                                   <TableCell className="font-medium text-red-600">
-                                    {stat.doFirst}
+                                    {rStats?.doFirst ?? 0}
                                   </TableCell>
-                                  <TableCell className="font-medium">
-                                    {branchTotal}
+                                  <TableCell>
+                                    {(rStats?.errors ?? 0) > 0 ? (
+                                      <Badge
+                                        variant="destructive"
+                                        className="text-xs"
+                                      >
+                                        {rStats?.errors}
+                                      </Badge>
+                                    ) : (
+                                      <span className="text-green-600 text-sm">
+                                        0
+                                      </span>
+                                    )}
                                   </TableCell>
                                 </TableRow>
                               );
                             })}
-                            {/* Totals row */}
-                            <TableRow className="bg-muted/30 font-bold border-t-2">
-                              <TableCell className="font-display font-bold">
+                            <TableRow className="bg-muted/30 border-t-2 font-bold">
+                              <TableCell className="border-r font-display font-bold">
                                 Total
+                              </TableCell>
+                              <TableCell className="font-bold text-blue-700">
+                                {enrollmentFileRecordCount}
+                              </TableCell>
+                              <TableCell className="border-r font-bold text-red-600">
+                                {enrollmentErrors.length}
+                              </TableCell>
+                              <TableCell className="font-bold text-purple-700">
+                                {examRegFileRecordCount}
                               </TableCell>
                               <TableCell className="font-bold text-green-700">
                                 {totalDone}
@@ -2276,8 +2881,8 @@ export default function DeanDashboard() {
                               <TableCell className="font-bold text-red-600">
                                 {totalDoFirst}
                               </TableCell>
-                              <TableCell className="font-bold">
-                                {totalStudents}
+                              <TableCell className="font-bold text-red-600">
+                                {examRegErrors.length}
                               </TableCell>
                             </TableRow>
                           </TableBody>
@@ -2286,23 +2891,47 @@ export default function DeanDashboard() {
                     </CardContent>
                   </Card>
 
-                  {/* ── Done Registrations Detail Table ── */}
+                  {/* Done Registrations Detail */}
                   <Card>
                     <CardHeader>
-                      <CardTitle className="font-display text-base flex items-center gap-2">
-                        <CheckCircle2 className="h-4 w-4 text-green-600" />
-                        Done Registrations
-                        <Badge className="bg-green-100 text-green-800 border-green-200 ml-1">
-                          {doneRegistrations.length}
-                        </Badge>
-                      </CardTitle>
+                      <div className="flex flex-wrap items-center gap-3 justify-between">
+                        <CardTitle className="font-display text-base flex items-center gap-2">
+                          <CheckCircle2 className="h-4 w-4 text-green-600" />
+                          Done Registrations
+                          <Badge className="bg-green-100 text-green-800 border-green-200 ml-1">
+                            {doneRegistrations.length}
+                          </Badge>
+                        </CardTitle>
+                        <Select
+                          value={doneBranchFilter}
+                          onValueChange={(v) => {
+                            setDoneBranchFilter(v);
+                            setDonePage(1);
+                          }}
+                        >
+                          <SelectTrigger
+                            className="w-32 h-8"
+                            data-ocid="dean.statistics.done.branch.select"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="All">All Branches</SelectItem>
+                            {BRANCHES.map((b) => (
+                              <SelectItem key={b} value={b}>
+                                {b}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
                       <p className="text-xs text-muted-foreground mt-1">
-                        Students with payment_failed or payment_complete status
-                        — registration confirmed.
+                        Students with payment_complete / complete status —
+                        registration confirmed.
                       </p>
                     </CardHeader>
                     <CardContent>
-                      {doneRegistrations.length === 0 ? (
+                      {filteredDoneRegs.length === 0 ? (
                         <div
                           data-ocid="dean.statistics.done.empty_state"
                           className="text-center py-10 text-muted-foreground"
@@ -2316,11 +2945,11 @@ export default function DeanDashboard() {
                             Showing {(donePage - 1) * DONE_PAGE_SIZE + 1}–
                             {Math.min(
                               donePage * DONE_PAGE_SIZE,
-                              doneRegistrations.length,
+                              filteredDoneRegs.length,
                             )}{" "}
                             of{" "}
                             <strong className="text-foreground">
-                              {doneRegistrations.length}
+                              {filteredDoneRegs.length}
                             </strong>{" "}
                             done registrations
                           </p>
@@ -2331,24 +2960,21 @@ export default function DeanDashboard() {
                             <Table>
                               <TableHeader>
                                 <TableRow className="bg-green-50">
-                                  <TableHead className="text-green-700">
-                                    #
-                                  </TableHead>
-                                  <TableHead className="text-green-700">
-                                    Student ID
-                                  </TableHead>
-                                  <TableHead className="text-green-700">
-                                    Email
-                                  </TableHead>
-                                  <TableHead className="text-green-700">
-                                    Course ID
-                                  </TableHead>
-                                  <TableHead className="text-green-700">
-                                    Branch
-                                  </TableHead>
-                                  <TableHead className="text-green-700">
-                                    Payment Status
-                                  </TableHead>
+                                  {[
+                                    "#",
+                                    "Roll No",
+                                    "Email",
+                                    "Course ID",
+                                    "Branch",
+                                    "Payment Status",
+                                  ].map((h) => (
+                                    <TableHead
+                                      key={h}
+                                      className="text-green-700"
+                                    >
+                                      {h}
+                                    </TableHead>
+                                  ))}
                                 </TableRow>
                               </TableHeader>
                               <TableBody>
@@ -2367,7 +2993,7 @@ export default function DeanDashboard() {
                                       {r.email || "-"}
                                     </TableCell>
                                     <TableCell className="font-mono text-sm">
-                                      {r.examCourseId ?? r.courseId}
+                                      {r.courseId}
                                     </TableCell>
                                     <TableCell>
                                       <Badge
@@ -2425,1098 +3051,49 @@ export default function DeanDashboard() {
                 </div>
               )}
             </TabsContent>
-
-            {/* ── All Errors ── */}
-            <TabsContent value="errors">
-              {noDataUploaded ? (
-                <div
-                  data-ocid="dean.errors.empty_state"
-                  className="flex flex-col items-center gap-4 py-20 text-center text-muted-foreground"
-                >
-                  <AlertCircle className="h-14 w-14 text-muted-foreground/40" />
-                  <div>
-                    <p className="font-display font-bold text-lg text-foreground">
-                      No Data Uploaded
-                    </p>
-                    <p className="text-sm mt-1 max-w-sm">
-                      No data uploaded yet. Upload student data to see errors.
-                      Go to the <strong>Data Upload</strong> tab to get started.
-                    </p>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-6">
-                  <Card>
-                    <CardHeader>
-                      <div className="flex flex-wrap items-center gap-3 justify-between">
-                        <CardTitle className="font-display text-base flex items-center gap-2">
-                          <AlertCircle className="h-4 w-4 text-destructive" />
-                          All Student Errors
-                          <Badge variant="destructive">
-                            {filteredErrors.length}
-                          </Badge>
-                        </CardTitle>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <Filter className="h-4 w-4 text-muted-foreground" />
-                          <Select
-                            value={errorBranchFilter}
-                            onValueChange={(v) => {
-                              setErrorBranchFilter(v);
-                              setErrorPage(1);
-                            }}
-                          >
-                            <SelectTrigger
-                              className="w-32 h-8"
-                              data-ocid="dean.errors.branch.select"
-                            >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="All">All Branches</SelectItem>
-                              {BRANCHES.map((b) => (
-                                <SelectItem key={b} value={b}>
-                                  {b}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Select
-                            value={errorTypeFilter}
-                            onValueChange={(v) => {
-                              setErrorTypeFilter(v);
-                              setErrorPage(1);
-                            }}
-                          >
-                            <SelectTrigger
-                              className="w-44 h-8"
-                              data-ocid="dean.errors.type.select"
-                            >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="All">
-                                All Error Types
-                              </SelectItem>
-                              {uniqueErrorTypes.map((t) => (
-                                <SelectItem key={t} value={t}>
-                                  {t}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-8 gap-1 text-xs"
-                            data-ocid="dean.errors.download_button"
-                            onClick={() =>
-                              downloadErrorsAsExcel(
-                                filteredErrors,
-                                `all-errors-${new Date().toISOString().slice(0, 10)}.xlsx`,
-                              )
-                            }
-                          >
-                            <Download className="h-3 w-3" /> Download
-                          </Button>
-                        </div>
-                      </div>
-                    </CardHeader>
-                    <CardContent>
-                      {filteredErrors.length === 0 ? (
-                        <div
-                          data-ocid="dean.errors.empty_state"
-                          className="text-center py-12 text-muted-foreground"
-                        >
-                          <CheckCircle2 className="h-10 w-10 mx-auto mb-2 text-green-400" />
-                          <p>No errors match the selected filters.</p>
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          {/* Row count info */}
-                          <p className="text-xs text-muted-foreground px-1">
-                            Showing {(errorPage - 1) * ERROR_PAGE_SIZE + 1}–
-                            {Math.min(
-                              errorPage * ERROR_PAGE_SIZE,
-                              filteredErrors.length,
-                            )}{" "}
-                            of{" "}
-                            <strong className="text-foreground">
-                              {filteredErrors.length}
-                            </strong>{" "}
-                            errors
-                          </p>
-                          <div
-                            className="rounded-lg border overflow-x-auto"
-                            data-ocid="dean.errors.table"
-                          >
-                            <Table>
-                              <TableHeader>
-                                <TableRow className="bg-muted/50">
-                                  <TableHead>Type</TableHead>
-                                  <TableHead>Branch</TableHead>
-                                  <TableHead>Student ID</TableHead>
-                                  <TableHead>Email</TableHead>
-                                  <TableHead>Course ID</TableHead>
-                                  <TableHead>Course Name</TableHead>
-                                  <TableHead>Error Type</TableHead>
-                                  <TableHead>Details</TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {pagedErrors.map((err, i) => (
-                                  <TableRow
-                                    key={`${err.id}-${i}`}
-                                    data-ocid={`dean.errors.row.${i + 1}`}
-                                  >
-                                    <TableCell>
-                                      <Badge
-                                        variant="outline"
-                                        className={`text-xs ${
-                                          err.type === "Enrollment"
-                                            ? "border-blue-400 text-blue-700"
-                                            : "border-purple-400 text-purple-700"
-                                        }`}
-                                      >
-                                        {err.type}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-xs"
-                                      >
-                                        {err.branch}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {err.studentId}
-                                    </TableCell>
-                                    <TableCell className="text-sm">
-                                      {err.email}
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {err.courseId}
-                                    </TableCell>
-                                    <TableCell className="text-sm max-w-xs truncate">
-                                      {err.courseName || "-"}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="destructive"
-                                        className="text-xs"
-                                      >
-                                        {err.errorType}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        onClick={() =>
-                                          setViewErrorDeanDialog({
-                                            details: err.details,
-                                            courseName: err.courseName,
-                                            courseId: err.courseId,
-                                            errorType: err.errorType,
-                                            studentId: err.studentId,
-                                          })
-                                        }
-                                        className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
-                                        data-ocid="dean.errors.view_button"
-                                      >
-                                        <Eye className="h-3 w-3" /> View
-                                      </Button>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </div>
-                          {/* Pagination controls */}
-                          {totalErrorPages > 1 && (
-                            <div className="flex items-center justify-between pt-2">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setErrorPage((p) => Math.max(1, p - 1))
-                                }
-                                disabled={errorPage === 1}
-                                data-ocid="dean.errors.pagination_prev"
-                              >
-                                Previous
-                              </Button>
-                              <span className="text-sm text-muted-foreground">
-                                Page {errorPage} of {totalErrorPages}
-                              </span>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setErrorPage((p) =>
-                                    Math.min(totalErrorPages, p + 1),
-                                  )
-                                }
-                                disabled={errorPage === totalErrorPages}
-                                data-ocid="dean.errors.pagination_next"
-                              >
-                                Next
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-
-                  {/* ── HOD Edited Records ── */}
-                  <Card>
-                    <CardHeader>
-                      <CardTitle className="font-display text-base flex items-center gap-2">
-                        <PenLine className="h-4 w-4 text-indigo-600" />
-                        HOD Edited Records
-                        <Badge className="bg-indigo-100 text-indigo-800 border-indigo-200 ml-1">
-                          {hodEditedRecords.length}
-                        </Badge>
-                      </CardTitle>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        Records edited by HODs — visible to both HOD and Dean.
-                      </p>
-                    </CardHeader>
-                    <CardContent>
-                      {hodEditedRecords.length === 0 ? (
-                        <div
-                          data-ocid="dean.hod_edits.empty_state"
-                          className="text-center py-10 text-muted-foreground"
-                        >
-                          <PenLine className="h-10 w-10 mx-auto mb-2 text-muted-foreground/40" />
-                          <p>
-                            No HOD edits yet. Edits made by HODs will appear
-                            here.
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          <p className="text-xs text-muted-foreground px-1">
-                            Showing {(hodEditPage - 1) * HOD_EDIT_PAGE_SIZE + 1}
-                            –
-                            {Math.min(
-                              hodEditPage * HOD_EDIT_PAGE_SIZE,
-                              hodEditedRecords.length,
-                            )}{" "}
-                            of{" "}
-                            <strong className="text-foreground">
-                              {hodEditedRecords.length}
-                            </strong>{" "}
-                            edits
-                          </p>
-                          <div
-                            className="rounded-lg border overflow-x-auto"
-                            data-ocid="dean.hod_edits.table"
-                          >
-                            <Table>
-                              <TableHeader>
-                                <TableRow className="bg-indigo-50/60">
-                                  <TableHead className="text-indigo-700">
-                                    #
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    Branch
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    File Type
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    Student ID
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    Email
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    Course ID
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    Error Type
-                                  </TableHead>
-                                  <TableHead className="text-indigo-700">
-                                    Edited At
-                                  </TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {pagedHodEdits.map((rec, i) => (
-                                  <TableRow
-                                    key={`${rec.id}-${i}`}
-                                    data-ocid={`dean.hod_edits.row.${i + 1}`}
-                                  >
-                                    <TableCell className="text-muted-foreground text-xs">
-                                      {(hodEditPage - 1) * HOD_EDIT_PAGE_SIZE +
-                                        i +
-                                        1}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-xs"
-                                      >
-                                        {rec.branch}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="outline"
-                                        className={`text-xs ${rec.fileType === "Enrollment" ? "border-blue-400 text-blue-700" : "border-purple-400 text-purple-700"}`}
-                                      >
-                                        {rec.fileType}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {rec.newStudentId ?? rec.studentId}
-                                      {rec.newStudentId &&
-                                        rec.newStudentId !== rec.studentId && (
-                                          <span className="text-xs text-muted-foreground ml-1">
-                                            (was: {rec.studentId})
-                                          </span>
-                                        )}
-                                    </TableCell>
-                                    <TableCell className="text-sm">
-                                      {rec.newEmail ?? rec.email}
-                                      {rec.newEmail &&
-                                        rec.newEmail !== rec.email && (
-                                          <span className="text-xs text-muted-foreground ml-1">
-                                            (was: {rec.email})
-                                          </span>
-                                        )}
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {rec.newCourseId ?? rec.courseId}
-                                      {rec.newCourseId &&
-                                        rec.newCourseId !== rec.courseId && (
-                                          <span className="text-xs text-muted-foreground ml-1">
-                                            (was: {rec.courseId})
-                                          </span>
-                                        )}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="destructive"
-                                        className="text-xs"
-                                      >
-                                        {rec.errorType}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell className="text-xs text-muted-foreground whitespace-nowrap">
-                                      {new Date(rec.editedAt).toLocaleString(
-                                        "en-IN",
-                                      )}
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </div>
-                          {totalHodEditPages > 1 && (
-                            <div className="flex items-center justify-between pt-2">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setHodEditPage((p) => Math.max(1, p - 1))
-                                }
-                                disabled={hodEditPage === 1}
-                                data-ocid="dean.hod_edits.pagination_prev"
-                              >
-                                Previous
-                              </Button>
-                              <span className="text-sm text-muted-foreground">
-                                Page {hodEditPage} of {totalHodEditPages}
-                              </span>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setHodEditPage((p) =>
-                                    Math.min(totalHodEditPages, p + 1),
-                                  )
-                                }
-                                disabled={hodEditPage === totalHodEditPages}
-                                data-ocid="dean.hod_edits.pagination_next"
-                              >
-                                Next
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-                  {/* Cross-match Errors */}
-                  {crossMatchErrors.length > 0 && (
-                    <Card className="border-orange-200">
-                      <CardHeader>
-                        <CardTitle className="font-display text-base flex items-center gap-2">
-                          <AlertCircle className="h-4 w-4 text-orange-500" />
-                          Cross-match Errors (Enrollment vs Exam Registration)
-                          <Badge className="bg-orange-100 text-orange-700 border-orange-300">
-                            {crossMatchErrors.length}
-                          </Badge>
-                        </CardTitle>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          Students enrolled in 12-week courses without exam
-                          registration, or exam registered without enrollment
-                        </p>
-                      </CardHeader>
-                      <CardContent>
-                        <div className="rounded-lg border overflow-x-auto">
-                          <Table>
-                            <TableHeader>
-                              <TableRow className="bg-muted/50">
-                                <TableHead>Student ID</TableHead>
-                                <TableHead>Email</TableHead>
-                                <TableHead>Course Name</TableHead>
-                                <TableHead>Course ID</TableHead>
-                                <TableHead>Error Type</TableHead>
-                                <TableHead>Description</TableHead>
-                                <TableHead>Branch</TableHead>
-                              </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                              {crossMatchErrors.slice(0, 100).map((err, i) => (
-                                <TableRow
-                                  key={`cm-${err.studentId}-${err.courseId}-${err.errorType}`}
-                                  data-ocid={`dean.crossmatch.row.${i + 1}`}
-                                >
-                                  <TableCell className="font-mono text-xs">
-                                    {err.studentId}
-                                  </TableCell>
-                                  <TableCell className="text-xs">
-                                    {err.email}
-                                  </TableCell>
-                                  <TableCell>
-                                    <span className="font-semibold text-primary text-xs">
-                                      {err.courseName || "-"}
-                                    </span>
-                                  </TableCell>
-                                  <TableCell className="font-mono text-xs">
-                                    {err.courseId}
-                                  </TableCell>
-                                  <TableCell>
-                                    <Badge
-                                      variant={
-                                        err.errorType ===
-                                        "Missing Exam Registration"
-                                          ? "destructive"
-                                          : "outline"
-                                      }
-                                      className="text-xs whitespace-nowrap"
-                                    >
-                                      {err.errorType}
-                                    </Badge>
-                                  </TableCell>
-                                  <TableCell className="text-xs text-muted-foreground">
-                                    {err.details}
-                                  </TableCell>
-                                  <TableCell>
-                                    <Badge
-                                      variant="outline"
-                                      className="text-xs"
-                                    >
-                                      {err.branch}
-                                    </Badge>
-                                  </TableCell>
-                                </TableRow>
-                              ))}
-                            </TableBody>
-                          </Table>
-                        </div>
-                        {crossMatchErrors.length > 100 && (
-                          <p className="text-xs text-muted-foreground mt-2">
-                            Showing first 100 of {crossMatchErrors.length}{" "}
-                            cross-match errors.
-                          </p>
-                        )}
-                      </CardContent>
-                    </Card>
-                  )}
-                </div>
-              )}
-            </TabsContent>
-            {/* ── Enrollment Errors (separate tab) ── */}
-            <TabsContent value="enrollment-errors">
-              {!deanStudentDataUploaded ? (
-                <div
-                  data-ocid="dean.enrollment_errors.empty_state"
-                  className="flex flex-col items-center gap-4 py-20 text-center text-muted-foreground"
-                >
-                  <BookOpen className="h-14 w-14 text-muted-foreground/40" />
-                  <div>
-                    <p className="font-display font-bold text-lg text-foreground">
-                      No Enrollment Data Uploaded
-                    </p>
-                    <p className="text-sm mt-1 max-w-sm">
-                      Upload student enrollment data first to see enrollment
-                      errors.
-                    </p>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <Card>
-                    <CardHeader>
-                      <div className="flex flex-wrap items-center gap-3 justify-between">
-                        <CardTitle className="font-display text-base flex items-center gap-2">
-                          <BookOpen className="h-4 w-4 text-blue-600" />
-                          Enrollment Errors
-                          <Badge variant="destructive">
-                            {filteredEnrollErrors.length}
-                          </Badge>
-                        </CardTitle>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <Filter className="h-4 w-4 text-muted-foreground" />
-                          <Select
-                            value={enrollErrBranchFilter}
-                            onValueChange={(v) => {
-                              setEnrollErrBranchFilter(v);
-                              setEnrollErrPage(1);
-                            }}
-                          >
-                            <SelectTrigger
-                              className="w-32 h-8"
-                              data-ocid="dean.enrollment_errors.branch.select"
-                            >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="All">All Branches</SelectItem>
-                              {BRANCHES.map((b) => (
-                                <SelectItem key={b} value={b}>
-                                  {b}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Select
-                            value={enrollErrTypeFilter}
-                            onValueChange={(v) => {
-                              setEnrollErrTypeFilter(v);
-                              setEnrollErrPage(1);
-                            }}
-                          >
-                            <SelectTrigger
-                              className="w-44 h-8"
-                              data-ocid="dean.enrollment_errors.type.select"
-                            >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="All">
-                                All Error Types
-                              </SelectItem>
-                              {uniqueEnrollErrTypes.map((t) => (
-                                <SelectItem key={t} value={t}>
-                                  {t}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-8 gap-1 text-xs"
-                            data-ocid="dean.enrollment_errors.download_button"
-                            onClick={() =>
-                              downloadErrorsAsExcel(
-                                filteredEnrollErrors,
-                                `enrollment-errors-${new Date().toISOString().slice(0, 10)}.xlsx`,
-                              )
-                            }
-                          >
-                            <Download className="h-3 w-3" /> Download
-                          </Button>
-                        </div>
-                      </div>
-                    </CardHeader>
-                    <CardContent>
-                      {filteredEnrollErrors.length === 0 ? (
-                        <div
-                          data-ocid="dean.enrollment_errors.empty_state"
-                          className="text-center py-12 text-muted-foreground"
-                        >
-                          <CheckCircle2 className="h-10 w-10 mx-auto mb-2 text-green-400" />
-                          <p>
-                            No enrollment errors found
-                            {enrollErrBranchFilter !== "All" ||
-                            enrollErrTypeFilter !== "All"
-                              ? " for selected filters"
-                              : ""}
-                            .
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          <p className="text-xs text-muted-foreground px-1">
-                            Showing {(enrollErrPage - 1) * ERRORS_PAGE_SIZE + 1}
-                            –
-                            {Math.min(
-                              enrollErrPage * ERRORS_PAGE_SIZE,
-                              filteredEnrollErrors.length,
-                            )}{" "}
-                            of{" "}
-                            <strong className="text-foreground">
-                              {filteredEnrollErrors.length}
-                            </strong>{" "}
-                            enrollment errors
-                          </p>
-                          <div
-                            className="rounded-lg border overflow-x-auto"
-                            data-ocid="dean.enrollment_errors.table"
-                          >
-                            <Table>
-                              <TableHeader>
-                                <TableRow className="bg-blue-50/60">
-                                  <TableHead className="text-blue-700">
-                                    #
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Branch
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Student ID
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Email
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Course ID
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Course Name
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Error Type
-                                  </TableHead>
-                                  <TableHead className="text-blue-700">
-                                    Details
-                                  </TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {pagedEnrollErrors.map((err, i) => (
-                                  <TableRow
-                                    key={`${err.id}-${i}`}
-                                    data-ocid={`dean.enrollment_errors.row.${i + 1}`}
-                                  >
-                                    <TableCell className="text-muted-foreground text-xs">
-                                      {(enrollErrPage - 1) * ERRORS_PAGE_SIZE +
-                                        i +
-                                        1}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-xs"
-                                      >
-                                        {err.branch}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {err.studentId}
-                                    </TableCell>
-                                    <TableCell className="text-sm">
-                                      {err.email}
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {err.courseId}
-                                    </TableCell>
-                                    <TableCell className="text-sm max-w-xs truncate">
-                                      {err.courseName || "-"}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="destructive"
-                                        className="text-xs"
-                                      >
-                                        {err.errorType}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        onClick={() =>
-                                          setViewErrorDeanDialog({
-                                            details: err.details,
-                                            courseName: err.courseName,
-                                            courseId: err.courseId,
-                                            errorType: err.errorType,
-                                            studentId: err.studentId,
-                                          })
-                                        }
-                                        className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
-                                        data-ocid="dean.enrollment_errors.view_button"
-                                      >
-                                        <Eye className="h-3 w-3" /> View
-                                      </Button>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </div>
-                          {totalEnrollErrPages > 1 && (
-                            <div className="flex items-center justify-between pt-2">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setEnrollErrPage((p) => Math.max(1, p - 1))
-                                }
-                                disabled={enrollErrPage === 1}
-                                data-ocid="dean.enrollment_errors.pagination_prev"
-                              >
-                                Previous
-                              </Button>
-                              <span className="text-sm text-muted-foreground">
-                                Page {enrollErrPage} of {totalEnrollErrPages}
-                              </span>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setEnrollErrPage((p) =>
-                                    Math.min(totalEnrollErrPages, p + 1),
-                                  )
-                                }
-                                disabled={enrollErrPage === totalEnrollErrPages}
-                                data-ocid="dean.enrollment_errors.pagination_next"
-                              >
-                                Next
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-                </div>
-              )}
-            </TabsContent>
-
-            {/* ── Exam Reg Errors (separate tab) ── */}
-            <TabsContent value="examreg-errors">
-              {!deanExamRegDataUploaded ? (
-                <div
-                  data-ocid="dean.examreg_errors.empty_state"
-                  className="flex flex-col items-center gap-4 py-20 text-center text-muted-foreground"
-                >
-                  <XCircle className="h-14 w-14 text-muted-foreground/40" />
-                  <div>
-                    <p className="font-display font-bold text-lg text-foreground">
-                      No Exam Registration Data Uploaded
-                    </p>
-                    <p className="text-sm mt-1 max-w-sm">
-                      Upload exam registration data to see exam registration
-                      errors. Go to the <strong>Data Upload</strong> tab to
-                      upload the exam registration file.
-                    </p>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <Card>
-                    <CardHeader>
-                      <div className="flex flex-wrap items-center gap-3 justify-between">
-                        <CardTitle className="font-display text-base flex items-center gap-2">
-                          <ClipboardCheck className="h-4 w-4 text-purple-600" />
-                          Exam Registration Errors
-                          <Badge variant="destructive">
-                            {filteredExamRegErrList.length}
-                          </Badge>
-                        </CardTitle>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <Filter className="h-4 w-4 text-muted-foreground" />
-                          <Select
-                            value={examErrBranchFilter}
-                            onValueChange={(v) => {
-                              setExamErrBranchFilter(v);
-                              setExamErrPage(1);
-                            }}
-                          >
-                            <SelectTrigger
-                              className="w-32 h-8"
-                              data-ocid="dean.examreg_errors.branch.select"
-                            >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="All">All Branches</SelectItem>
-                              {BRANCHES.map((b) => (
-                                <SelectItem key={b} value={b}>
-                                  {b}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Select
-                            value={examErrTypeFilter}
-                            onValueChange={(v) => {
-                              setExamErrTypeFilter(v);
-                              setExamErrPage(1);
-                            }}
-                          >
-                            <SelectTrigger
-                              className="w-44 h-8"
-                              data-ocid="dean.examreg_errors.type.select"
-                            >
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="All">
-                                All Error Types
-                              </SelectItem>
-                              {uniqueExamErrTypes.map((t) => (
-                                <SelectItem key={t} value={t}>
-                                  {t}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-8 gap-1 text-xs"
-                            data-ocid="dean.examreg_errors.download_button"
-                            onClick={() =>
-                              downloadErrorsAsExcel(
-                                filteredExamRegErrList,
-                                `examreg-errors-${new Date().toISOString().slice(0, 10)}.xlsx`,
-                              )
-                            }
-                          >
-                            <Download className="h-3 w-3" /> Download
-                          </Button>
-                        </div>
-                      </div>
-                    </CardHeader>
-                    <CardContent>
-                      {filteredExamRegErrList.length === 0 ? (
-                        <div
-                          data-ocid="dean.examreg_errors.empty_state"
-                          className="text-center py-12 text-muted-foreground"
-                        >
-                          <CheckCircle2 className="h-10 w-10 mx-auto mb-2 text-green-400" />
-                          <p>
-                            No exam registration errors found
-                            {examErrBranchFilter !== "All" ||
-                            examErrTypeFilter !== "All"
-                              ? " for selected filters"
-                              : ""}
-                            .
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          <p className="text-xs text-muted-foreground px-1">
-                            Showing {(examErrPage - 1) * ERRORS_PAGE_SIZE + 1}–
-                            {Math.min(
-                              examErrPage * ERRORS_PAGE_SIZE,
-                              filteredExamRegErrList.length,
-                            )}{" "}
-                            of{" "}
-                            <strong className="text-foreground">
-                              {filteredExamRegErrList.length}
-                            </strong>{" "}
-                            exam registration errors
-                          </p>
-                          <div
-                            className="rounded-lg border overflow-x-auto"
-                            data-ocid="dean.examreg_errors.table"
-                          >
-                            <Table>
-                              <TableHeader>
-                                <TableRow className="bg-purple-50/60">
-                                  <TableHead className="text-purple-700">
-                                    #
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Branch
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Student ID
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Email
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Course ID
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Course Name
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Payment Status
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Error Type
-                                  </TableHead>
-                                  <TableHead className="text-purple-700">
-                                    Details
-                                  </TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {pagedExamErrors.map((err, i) => (
-                                  <TableRow
-                                    key={`${err.id}-${i}`}
-                                    data-ocid={`dean.examreg_errors.row.${i + 1}`}
-                                  >
-                                    <TableCell className="text-muted-foreground text-xs">
-                                      {(examErrPage - 1) * ERRORS_PAGE_SIZE +
-                                        i +
-                                        1}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="secondary"
-                                        className="text-xs"
-                                      >
-                                        {err.branch}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {err.studentId}
-                                    </TableCell>
-                                    <TableCell className="text-sm">
-                                      {err.email}
-                                    </TableCell>
-                                    <TableCell className="font-mono text-sm">
-                                      {err.courseId}
-                                    </TableCell>
-                                    <TableCell className="text-sm max-w-xs truncate">
-                                      {err.courseName || "-"}
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="outline"
-                                        className="text-xs border-amber-400 text-amber-700 bg-amber-50"
-                                      >
-                                        {err.paymentStatus || "N/A"}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Badge
-                                        variant="destructive"
-                                        className="text-xs"
-                                      >
-                                        {err.errorType}
-                                      </Badge>
-                                    </TableCell>
-                                    <TableCell>
-                                      <Button
-                                        size="sm"
-                                        variant="ghost"
-                                        onClick={() =>
-                                          setViewErrorDeanDialog({
-                                            details: err.details ?? "",
-                                            courseName: err.courseName,
-                                            courseId: (err as any).courseId,
-                                            errorType: err.errorType,
-                                            studentId: err.studentId,
-                                          })
-                                        }
-                                        className="h-7 px-2 gap-1 text-blue-600 hover:text-blue-800"
-                                        data-ocid="dean.examreg_errors.view_button"
-                                      >
-                                        <Eye className="h-3 w-3" /> View
-                                      </Button>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </div>
-                          {totalExamErrPages > 1 && (
-                            <div className="flex items-center justify-between pt-2">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setExamErrPage((p) => Math.max(1, p - 1))
-                                }
-                                disabled={examErrPage === 1}
-                                data-ocid="dean.examreg_errors.pagination_prev"
-                              >
-                                Previous
-                              </Button>
-                              <span className="text-sm text-muted-foreground">
-                                Page {examErrPage} of {totalExamErrPages}
-                              </span>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() =>
-                                  setExamErrPage((p) =>
-                                    Math.min(totalExamErrPages, p + 1),
-                                  )
-                                }
-                                disabled={examErrPage === totalExamErrPages}
-                                data-ocid="dean.examreg_errors.pagination_next"
-                              >
-                                Next
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-                </div>
-              )}
-            </TabsContent>
           </Tabs>
         </motion.div>
       </main>
-      {/* View Error Details Dialog - Dean */}
-      {viewErrorDeanDialog && (
-        <Dialog open={true} onOpenChange={() => setViewErrorDeanDialog(null)}>
+
+      {/* Error details dialog */}
+      {viewErrorDialog && (
+        <Dialog open={true} onOpenChange={() => setViewErrorDialog(null)}>
           <DialogContent
             className="max-w-md"
             data-ocid="dean.view_error.dialog"
           >
             <DialogHeader>
-              <DialogTitle className="flex items-center gap-2 text-red-700">
+              <DialogTitle className="flex items-center gap-2 text-destructive">
                 <Eye className="h-4 w-4" />
                 Error Details
               </DialogTitle>
             </DialogHeader>
             <div className="space-y-3 text-sm">
-              {viewErrorDeanDialog.courseName && (
+              {viewErrorDialog.courseName && (
                 <div>
                   <span className="font-semibold text-foreground">
                     Course Name:{" "}
                   </span>
                   <span className="font-bold text-blue-700">
-                    {viewErrorDeanDialog.courseName}
+                    {viewErrorDialog.courseName}
                   </span>
                 </div>
               )}
-              {viewErrorDeanDialog.courseId && (
+              {viewErrorDialog.courseId && (
                 <div>
                   <span className="font-semibold text-foreground">
                     Course ID:{" "}
                   </span>
-                  <span className="font-mono">
-                    {viewErrorDeanDialog.courseId}
-                  </span>
+                  <span className="font-mono">{viewErrorDialog.courseId}</span>
                 </div>
               )}
-              {viewErrorDeanDialog.errorType && (
+              {viewErrorDialog.errorType && (
                 <div>
                   <span className="font-semibold text-foreground">
                     Error Type:{" "}
                   </span>
                   <Badge variant="destructive" className="text-xs">
-                    {viewErrorDeanDialog.errorType}
+                    {viewErrorDialog.errorType}
                   </Badge>
                 </div>
               )}
@@ -3525,17 +3102,29 @@ export default function DeanDashboard() {
                   Description:{" "}
                 </span>
                 <span className="text-muted-foreground">
-                  {viewErrorDeanDialog.details}
+                  {viewErrorDialog.description}
                 </span>
               </div>
-              {viewErrorDeanDialog.studentId && (
+              {viewErrorDialog.studentId && (
                 <div>
                   <span className="font-semibold text-foreground">
-                    Student ID:{" "}
+                    Roll No:{" "}
                   </span>
-                  <span className="font-mono">
-                    {viewErrorDeanDialog.studentId}
+                  <span className="font-mono">{viewErrorDialog.studentId}</span>
+                </div>
+              )}
+              {viewErrorDialog.email && (
+                <div>
+                  <span className="font-semibold text-foreground">Email: </span>
+                  <span>{viewErrorDialog.email}</span>
+                </div>
+              )}
+              {viewErrorDialog.branch && (
+                <div>
+                  <span className="font-semibold text-foreground">
+                    Branch:{" "}
                   </span>
+                  <Badge variant="secondary">{viewErrorDialog.branch}</Badge>
                 </div>
               )}
             </div>

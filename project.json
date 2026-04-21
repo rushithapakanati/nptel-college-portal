@@ -1,0 +1,27 @@
+{
+  "overview": "A multi-campus NPTEL portal for RGUKT supporting four campuses (Nuzvid, Srikakulam, RK Valley, Ongole) with strict campus isolation, role-based dashboards for Students, HODs, and Deans, academic year/semester selection, file-driven data management, error validation, exam shuffle, and versioned uploads.",
+  "features": [
+    "Academic year/semester selection with full database isolation per selection",
+    "Campus-isolated role-based dashboards (Student, HOD, Dean) for 4 campuses",
+    "File-driven enrollment and exam registration with CSV/Excel parsing (100k+ rows)",
+    "Error validation with course ID format checks, email validation, cross-match detection",
+    "Exam shuffle upload and display with Roll No and Seating Position",
+    "File versioning with restore from previous uploads",
+    "HOD bulk edit mode with credit system",
+    "Error download as Excel for HOD and Dean",
+    "Double-prefix and personal email login support",
+    "Separate enrollment and exam registration statistics with branch-wise breakdowns"
+  ],
+  "category": "productivity",
+  "tags": [
+    "nptel",
+    "education",
+    "campus-portal",
+    "rgukt",
+    "enrollment",
+    "exam-registration",
+    "file-upload",
+    "role-based-access"
+  ],
+  "last_updated": "2026-04-11T11:52:45.974Z"
+}
