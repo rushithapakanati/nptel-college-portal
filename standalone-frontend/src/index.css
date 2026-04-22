@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary: oklch(0.32 0.12 264);
+  --primary-foreground: oklch(0.98 0 0);
+  --background: oklch(0.98 0.005 264);
+  --foreground: oklch(0.15 0.02 264);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.15 0.02 264);
+  --border: oklch(0.88 0.01 264);
+  --input: oklch(0.88 0.01 264);
+  --muted: oklch(0.95 0.005 264);
+  --muted-foreground: oklch(0.5 0.02 264);
+  --accent: oklch(0.88 0.12 85);
+  --accent-foreground: oklch(0.15 0.02 264);
+  --destructive: oklch(0.55 0.22 25);
+  --destructive-foreground: oklch(0.98 0 0);
+  --success: oklch(0.55 0.15 145);
+  --ring: oklch(0.55 0.18 264);
+  --secondary: oklch(0.93 0.01 264);
+  --secondary-foreground: oklch(0.25 0.06 264);
+  --radius: 0.5rem;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: oklch(0.98 0.005 264);
+  color: oklch(0.15 0.02 264);
+  font-family: 'General Sans', system-ui, sans-serif;
+  margin: 0;
+}
+
+@layer utilities {
+  .font-display {
+    font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+  }
+  .bg-background { background-color: var(--background); }
+  .bg-card { background-color: var(--card); }
+  .bg-muted { background-color: var(--muted); }
+  .bg-primary { background-color: var(--primary); }
+  .bg-secondary { background-color: var(--secondary); }
+  .bg-accent { background-color: var(--accent); }
+  .bg-destructive { background-color: var(--destructive); }
+  .text-foreground { color: var(--foreground); }
+  .text-card-foreground { color: var(--card-foreground); }
+  .text-muted-foreground { color: var(--muted-foreground); }
+  .text-primary { color: var(--primary); }
+  .text-secondary-foreground { color: var(--secondary-foreground); }
+  .text-primary-foreground { color: var(--primary-foreground); }
+  .text-destructive { color: var(--destructive); }
+  .text-accent-foreground { color: var(--accent-foreground); }
+  .border-border { border-color: var(--border); }
+  .border-input { border-color: var(--input); }
+  .ring-ring { --tw-ring-color: var(--ring); }
+
+  .animate-spin {
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+}
